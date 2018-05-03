@@ -563,14 +563,14 @@ removeLastElement list =
 
 -- Equivalent to Maybe.oneOf (List.map f list)
 -- but maps the list lazily to return early
+-- Equivalent of collectFirst
 mapFirstSuccess : (a -> Maybe b) -> List a -> Maybe b
 mapFirstSuccess f list =
   case list of
     []   -> Nothing
-    x::xs ->
-      case f x of
-        Just result -> Just result
+    x::xs -> case f x of
         Nothing     -> mapFirstSuccess f xs
+        res -> res
 
 firstOrLazySecond : Maybe a -> (() -> Maybe a) -> Maybe a
 firstOrLazySecond maybe1 lazyMaybe2 =

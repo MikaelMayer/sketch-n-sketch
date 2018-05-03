@@ -208,7 +208,7 @@ eval syntax env bt e =
 
   EBase _ v     -> Ok <| ret [] <| VBase (eBaseToVBase v)
   EVar _ x      -> Result.map (\v -> retV [v] v) <| lookupVar syntax env (e::bt) x e.start
-  EFun _ ps e _ -> Ok <| ret [] <| VClosure Nothing ps e env
+  EFun _ ps e _ -> Ok <| ret [] <| VClosure [] ps e env
   EOp _ op es _ -> Result.map (\res -> addParentToRet (res, env)) <| evalOp syntax env e (e::bt) op es
 
   EList _ es _ m _ ->
@@ -317,11 +317,12 @@ eval syntax env bt e =
         let evalVApp: Val -> List Exp -> Result String ((Val, Widgets), Env)
             evalVApp v1 es =
           case v1.v_ of
-            VClosure maybeRecName ps funcBody closureEnv ->
+            VClosure recNames ps funcBody closureEnv ->
               let argValsAndFuncRes =
-                case maybeRecName of
-                  Nothing    -> apply syntax env bt bt_ e ps es funcBody closureEnv
-                  Just fName -> apply syntax env bt bt_ e ps es funcBody ((fName, v1)::closureEnv)
+                let newEnv = recNames |> List.map (\fName -> 
+                  (fName, Utils.maybeFind fName closureEnv |> Utils.fromJust "Did not find recursive closure in its environment"))
+                in
+                apply syntax env bt bt_ e ps es funcBody (newEnv ++ closureEnv)
               in
               -- Do not record dependence on closure (which function to execute is essentially control flow).
               -- Dependence on function is implicit by being dependent on some value computed by an expression in the function.
@@ -341,7 +342,7 @@ eval syntax env bt e =
               let availableArgs = List.length es in
               if availableArgs < arity then -- Partial application, hence eta expansion
                 let funconverted = replaceV_ v1 <| VClosure
-                     Nothing
+                     []
                      (List.map (\a -> withDummyPatInfo <| PVar space1 a noWidgetDecl) <| argList)
                      (replaceE__ e <| EApp sp0 (replaceE__ e <| EVar space1 name)
                        (List.map (withDummyExpInfo << EVar space1) <| argList) SpaceApp sp0) ((name, v1)::env) in
@@ -383,7 +384,7 @@ eval syntax env bt e =
       Err s       -> Err s
       Ok (v1,ws1) ->
         case ((patEffectivePat p).val.p__, v1.v_) of
-          (PVar _ fname _, VClosure Nothing x body env_) ->
+          (PVar _ fname _, VClosure [] x body env_) ->
             let v1Named = { v1 | v_ = VClosure (Just fname) x body env_ } in
             case cons (pVar fname, v1Named) (Just env) of
               -- Don't add provenance: fine to say value is just from the let body.
@@ -677,10 +678,11 @@ apply syntax env bt bt_ e psLeft esLeft funcBody closureEnv =
       |> Result.andThen
           (\(fRetVal1, fRetWs1) ->
             case fRetVal1.v_ of
-              VClosure maybeRecName ps funcBody closureEnv ->
-                case maybeRecName of
-                  Nothing    -> recurse ps esLeft funcBody closureEnv                      |> Result.map (\(argVals, (v2, ws2)) -> (argVals, (v2, fRetWs1 ++ ws2)))
-                  Just fName -> recurse ps esLeft funcBody ((fName, fRetVal1)::closureEnv) |> Result.map (\(argVals, (v2, ws2)) -> (argVals, (v2, fRetWs1 ++ ws2)))
+              VClosure recNames ps funcBody closureEnv ->
+                let newEnv = recNames |> List.map (\fName -> 
+                  (fName, Utils.maybeFind fName closureEnv |> Utils.fromJust "Did not find recursive closure in its environment"))
+                in
+                recurse ps esLeft funcBody (newEnv ++ closureEnv) |> Result.map (\(argVals, (v2, ws2)) -> (argVals, (v2, fRetWs1 ++ ws2)))
               _ ->
                 errorWithBacktrace syntax (e::bt) <| strPos e.start ++ " too many arguments given to function"
           )
@@ -690,7 +692,7 @@ apply syntax env bt bt_ e psLeft esLeft funcBody closureEnv =
         -- Based-on provenance is only concerned with concrete values, so the provenance here
         -- is moot (i.e. for an application (e1 e2) the provenance of e1 is ignored).
         -- The provenance that matters is already attached to the values in the closureEnv.
-        finalVal = { v_ = VClosure Nothing psLeft funcBody closureEnv, provenance = dummyProvenance, parents = Parents [] }
+        finalVal = { v_ = VClosure [] psLeft funcBody closureEnv, provenance = dummyProvenance, parents = Parents [] }
       in
       Ok ([], (finalVal, []))
 

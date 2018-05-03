@@ -126,6 +126,10 @@ pruneEnvPattern pats env =
         List.filter (\(x, _) -> not <| Set.member x varspattern) env
         |> pruneEnvPattern tail
 
+removeVarsInEnv: Set Ident -> Env -> Env
+removeVarsInEnv boundVars env =
+  List.filter (\(x, _) -> not (Set.member x boundVars)) env
+        
 pruneEnv: Exp -> Env -> Env
 pruneEnv exp env = -- Remove all the initial environment that is on the right.
   let freeVars = freeIdentifiers exp in
@@ -231,16 +235,18 @@ valToExpFull copyFrom sp_ indent v =
             let headExp = (spaceCommaHead, v2expHead (ws <| foldIndentStyle "" (\_ -> " ") indent) (increaseIndent indent) head) in
             let tailExps = List.map (\y -> (spaceCommaTail, v2expTail (ws <| foldIndent " " <| increaseIndent indent) (increaseIndent indent) y)) tail in
             EList precedingWS (headExp :: tailExps) space0 Nothing spBeforeEnd
-    VClosure mRec patterns body env ->
-      let prunedEnv = pruneEnvPattern patterns (pruneEnv body env) in
+    VClosure recNames patterns body env ->
+      let (recEnv, remEnv) = Utils.split (List.length recNames) env in
+      let prunedEnv = removeVarsInEnv (Set.fromList recEnv) <| pruneEnvPattern patterns <| pruneEnv body <| env in
       case prunedEnv of
         [] -> EFun sp patterns body space0
         (name, v)::tail ->
           let baseCase =  withDummyExpInfo <| EFun (ws <| foldIndent "" indent) patterns body space0 in
           let startCase =
-                case mRec of
-                  Nothing -> baseCase
-                  Just f -> withDummyExpInfo <| ELet sp Let True (withDummyPatInfo <| PVar (ws " ") f noWidgetDecl) space1 baseCase space1 (withDummyExpInfo <| EVar (ws <| foldIndent " " indent) f) space0
+                case recNames of
+                  [] -> baseCase
+                  [f] -> withDummyExpInfo <| ELet sp Let True (withDummyPatInfo <| PVar (ws " ") f noWidgetDecl) space1 baseCase space1 (withDummyExpInfo <| EVar (ws <| foldIndent " " indent) f) space0
+                  _ -> Debug.crash "cannot convert back a VCLosure with multiple defs to an ELet. Need syntax support for that."
           in
           let bigbody = List.foldl (\(n, v) body -> withDummyExpInfo <| ELet (ws <| foldIndent "" indent) Let False (withDummyPatInfo <| PVar (ws " ") n noWidgetDecl) space1 (valToExp space1 (increaseIndent indent) v) space1 body space0) startCase tail
           in

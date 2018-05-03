@@ -145,9 +145,11 @@ type Pat__
   | PBase WS EBaseVal
   | PWildcard WS
   | PList WS (List Pat) WS (Maybe Pat) WS -- TODO store WS before commas, like EList
-  | PAs WS Ident WS Pat
+  | PAs WS Pat WS Pat
   | PParens WS Pat WS
   | PRecord WS {- { -}  (List (WS {- , -}, WS, Ident, WS{-=-}, Pat)) WS{- } -}
+  | PApp WS Exp (List Pat)
+  | PColonType WS Pat WS Type
 
 type Op_
   -- nullary ops
@@ -227,6 +229,20 @@ type ApplicationType = SpaceApp | LeftApp WS | RightApp WS | InfixApp
 
 -- TODO once Little syntax is deprecated, remove some unused WS args
 
+-- Type annotation for a let definition, e.g.
+-- let aux: Int -> Int
+--     aux a b c
+type TypeAnnotation = TypeAnnotation Pat WS Type
+
+-- 'aux = \a -> b' and 'aux a = b'
+-- are parsed the same way but the first one is EFunArgsAfterEqual, the second EFunArgAsPats
+type FunArgStyle = FunArgAsPats | FunArgsAfterEqual
+
+type LetExp =
+    LetExp (Maybe TypeAnnotation) Pat FunArgStyle WS{-before = -} Exp {- usual exp. -}
+  | LetType WS Pat FunArgStyle WS Type {- prefixed with ‘  type’ -}
+  | LetTypeAlias WS WS Pat FunArgStyle WS Type {- prefix with ‘  type   alias’-}
+
 type Exp__
   = EConst WS Num Loc WidgetDecl
   | EBase WS EBaseVal
@@ -239,14 +255,10 @@ type Exp__
   | EList WS (List (WS{-,-}, Exp)) WS (Maybe Exp) WS -- the first WS{-,-} is a dummy
   | EIf WS Exp WS{-then-} Exp WS{-else-} Exp WS{-REMOVE-}
   | ECase WS Exp (List Branch) WS
-  | ETypeCase WS Exp (List TBranch) WS
-  | ELet WS LetKind Rec Pat WS{-=-} Exp WS{-in or ;-} Exp WS{-REMOVE-}
+  | ELet WS LetKind (List LetExp) (List Int) {-unparsing order-} WS{-in or ;-} Exp
   | EComment WS String Exp
   | EOption WS (WithInfo String) WS (WithInfo String) Exp
-  | ETyp WS Pat Type Exp WS -- type declaration
   | EColonType WS Exp WS Type WS -- type annotation
-  | ETypeAlias WS Pat Type Exp WS -- type alias
-  | ETypeDef WS (WS, Ident) (List (WS, Ident)) WS (List DataConstructor) Exp WS
   | EParens WS Exp ParensStyle WS
   | EHole WS (Maybe Val) -- Internal intermediate, should not appear in code. (Yet.)
   | ERecord WS {- { -} (Maybe (Exp, WS) {- | -}) (List (WS, {-,-} WS, Ident, WS{-=-}, Exp)) {- }-} WS
@@ -335,7 +347,7 @@ type Parents = Parents (List Val) -- Avoiding recursive type alias :(
 type Val_
   = VConst (Maybe (Axis, NumTr, Val)) NumTr -- Maybe (Axis, value in other dimension, Val with provenance in other dimension)
   | VBase VBaseVal
-  | VClosure (Maybe Ident) (List Pat) Exp Env
+  | VClosure (List Ident) (List Pat) Exp Env
   | VList (List Val)
   | VRecord (Dict String Val) -- It's a record indexed by the keys
   | VDict VDict_ -- Can be constructed only by "dict [[key, value], [key2, value2]] and 'empty'
@@ -370,6 +382,12 @@ eBaseValsEqual ebv1 ebv2 =
     _                                -> False
 
 type Trace = TrLoc Loc | TrOp Op_ (List Trace)
+
+endPosLetExp: LetExp -> Pos
+endPosLetExp def = case def of
+  LetExp _ _ _ _ e1 -> e1.end
+  LetType _ _ _ _ t -> t.end
+  LetTypeAlias _ _ _ _ _ t -> t.end
 
 allTraceLocs : Trace -> List Loc
 allTraceLocs trace =
@@ -518,8 +536,8 @@ fitsOnLine s =
   else True
 
 isLet e = case e.val.e__ of
-  ELet _ _ _ _ _ _ _ _ _ -> True
-  _                      -> False
+  ELet _ _ _ _ _ _ -> True
+  _                -> False
 
 isList e = case e.val.e__ of
   EList _ _ _ _ _ -> True
@@ -556,15 +574,13 @@ expEffectiveExp exp =
 expEffectiveExps : Exp -> List Exp
 expEffectiveExps exp =
   case exp.val.e__ of
-    ETyp _ _ _ body _         -> exp :: expEffectiveExps body
-    EColonType _ body _ _ _   -> exp :: expEffectiveExps body
-    ETypeAlias _ _ _ body _   -> exp :: expEffectiveExps body
-    ELet _ _ _ _ _ _ _ body _ -> exp :: expEffectiveExps body
-    EParens _ e _ _           -> exp :: expEffectiveExps e
-    EComment _ _ e            -> exp :: expEffectiveExps e
-    EOption _ _ _ _ e         -> exp :: expEffectiveExps e
-    EOp _ {val} [operand] _   -> if val == DebugLog || val == NoWidgets then exp :: expEffectiveExps operand else [exp]
-    _                         -> [exp]
+    EColonType _ body _ _ _  -> exp :: expEffectiveExps body
+    ELet _ _ _ _ _ body      -> exp :: expEffectiveExps body
+    EParens _ e _ _          -> exp :: expEffectiveExps e
+    EComment _ _ e           -> exp :: expEffectiveExps e
+    EOption _ _ _ _ e        -> exp :: expEffectiveExps e
+    EOp _ {val} [operand] _  -> if val == DebugLog || val == NoWidgets then exp :: expEffectiveExps operand else [exp]
+    _                        -> [exp]
 
 -- Skip through PParens
 patEffectivePat : Pat -> Pat
@@ -666,20 +682,6 @@ mapFoldExp f initAcc e =
       let (newE1, newAcc2) = recurse newAcc e1 in
       wrapAndMap (ECase ws1 newE1 newBranches ws2) newAcc2
 
-    ETypeCase ws1 e1 tbranches ws2 ->
-      let (newBranches, newAcc) =
-        tbranches
-        |> List.foldr
-            (\tbranch (newBranches, acc) ->
-              let (TBranch_ bws1 t ei bws2) = tbranch.val in
-              let (newEi, newAcc) = recurse acc ei in
-              ({ tbranch | val = TBranch_ bws1 t newEi bws2 }::newBranches, newAcc)
-            )
-            ([], initAcc)
-      in
-      let (newE1, newAcc2) = recurse newAcc e1 in
-      wrapAndMap (ETypeCase ws1 newE1 newBranches ws2) newAcc2
-
     EComment ws s e1 ->
       let (newE1, newAcc) = recurse initAcc e1 in
       wrapAndMap (EComment ws s newE1) newAcc
@@ -688,26 +690,22 @@ mapFoldExp f initAcc e =
       let (newE1, newAcc) = recurse initAcc e1 in
       wrapAndMap (EOption ws1 s1 ws2 s2 newE1) newAcc
 
-    ELet ws1 k b p ws2 e1 ws3 e2 ws4 ->
-      let (newE2, newAcc) = recurse initAcc e2 in
-      let (newE1, newAcc2) = recurse newAcc e1 in
-      wrapAndMap (ELet ws1 k b p ws2 newE1 ws3 newE2 ws4) newAcc2
-
-    ETyp ws1 pat tipe e1 ws2 ->
-      let (newE1, newAcc) = recurse initAcc e1 in
-      wrapAndMap (ETyp ws1 pat tipe newE1 ws2) newAcc
+    ELet ws1 lettype definitions printOrder spaceBeforeIn body ->
+      let (newBody, newAcc) = recurse initAcc body in
+      let (newDefinitions, newAcc2) = Utils.foldLeft
+            ([],      newAcc) (List.reverse definitions) <|
+           \(accDefs, acc)    def ->
+              Tuple.mapFirst (\newDef -> newDef::accDefs) <|
+               case def of
+                 LetExp mbTyp name funPolicy spEq e1 -> Tuple.mapFirst (\newE1 -> LetExp mbTyp name funPolicy spEq newE1) <| recurse acc e1
+                 LetType spaceBeforeType name funPolicy spEq tp -> (def, acc)
+                 LetTypeAlias spaceBeforeType spaceBeforeAlias name funPolicy spEq tp -> (def, acc)
+      in
+      wrapAndMap (ELet ws1 lettype newDefinitions printOrder spaceBeforeIn newBody) newAcc2
 
     EColonType ws1 e1 ws2 tipe ws3 ->
       let (newE1, newAcc) = recurse initAcc e1 in
       wrapAndMap (EColonType ws1 newE1 ws2 tipe ws3) newAcc
-
-    ETypeAlias ws1 pat tipe e1 ws2 ->
-      let (newE1, newAcc) = recurse initAcc e1 in
-      wrapAndMap (ETypeAlias ws1 pat tipe newE1 ws2) newAcc
-
-    ETypeDef ws1 ident vars ws2 dcs e1 ws3 ->
-      let (newE1, newAcc) = recurse initAcc e1 in
-      wrapAndMap (ETypeDef ws1 ident vars ws2 dcs newE1 ws3) newAcc
 
     EParens ws1 e pStyle ws2 ->
       let (newE, newAcc) = recurse initAcc e in
@@ -753,13 +751,22 @@ mapFoldPat f initAcc p =
       let (newPs, newAcc) = recurseAll initAcc (Utils.recordValues ps) in
       wrapAndMap (PRecord ws1 (Utils.recordValuesMake ps newPs) ws2) newAcc
 
-    PAs ws1 ident ws2 pChild ->
-      let (newPChild, newAcc) = recurse initAcc pChild in
-      wrapAndMap (PAs ws1 ident ws2 newPChild) newAcc
+    PAs ws1 pChild1 ws2 pChild2 ->
+      let (newPChild2, newAcc) = recurse initAcc pChild2 in
+      let (newPChild1, newAcc2) = recurse newAcc pChild1 in
+      wrapAndMap (PAs ws1 newPChild1 ws2 newPChild2) newAcc2
 
     PParens ws1 pChild ws2 ->
       let (newPChild, newAcc) = recurse initAcc pChild in
       wrapAndMap (PParens ws1 newPChild ws2) newAcc
+
+    PColonType ws1 pChild ws2 tp      ->
+      let (newPChild, newAcc) = recurse initAcc pChild in
+      wrapAndMap (PColonType ws1 newPChild  ws2 tp) newAcc
+
+    PApp ws1 e ps ->
+      let (newPs, newAcc)  = recurseAll initAcc ps in
+      wrapAndMap (PApp ws1 e newPs) newAcc
 
 -- Nodes visited/replaced in top-down, left-to-right order.
 -- Careful, a poorly constructed mapping function can cause this to fail to terminate.
@@ -839,20 +846,6 @@ mapFoldExpTopDown f initAcc e =
       in
       ret (ECase ws1 newE1 newBranches ws2) newAcc3
 
-    ETypeCase ws1 e1 tbranches ws2 ->
-      let (newE1, newAcc2) = recurse newAcc e1 in
-      let (newBranches, newAcc3) =
-        tbranches
-        |> List.foldl
-            (\tbranch (newBranches, acc) ->
-              let (TBranch_ bws1 t ei bws2) = tbranch.val in
-              let (newEi, newAcc3) = recurse acc ei in
-              (newBranches ++ [{ tbranch | val = TBranch_ bws1 t newEi bws2 }], newAcc3)
-            )
-            ([], newAcc2)
-      in
-      ret (ETypeCase ws1 newE1 newBranches ws2) newAcc3
-
     EComment ws s e1 ->
       let (newE1, newAcc2) = recurse newAcc e1 in
       ret (EComment ws s newE1) newAcc2
@@ -861,26 +854,22 @@ mapFoldExpTopDown f initAcc e =
       let (newE1, newAcc2) = recurse newAcc e1 in
       ret (EOption ws1 s1 ws2 s2 newE1) newAcc2
 
-    ELet ws1 k b p ws2 e1 ws3 e2 ws4 ->
-      let (newE1, newAcc2) = recurse newAcc e1 in
-      let (newE2, newAcc3) = recurse newAcc2 e2 in
-      ret (ELet ws1 k b p ws2 newE1 ws3 newE2 ws4) newAcc3
-
-    ETyp ws1 pat tipe e1 ws2 ->
-      let (newE1, newAcc2) = recurse newAcc e1 in
-      ret (ETyp ws1 pat tipe newE1 ws2) newAcc2
+    ELet ws1 lettype definitions printOrder spaceBeforeIn body ->
+      let (newRevDefinitions, newAcc2) = Utils.foldLeft
+            ([],      newAcc) definitions <|
+           \(accDefs, acc)    def ->
+              Tuple.mapFirst (\newDef -> newDef::accDefs) <|
+               case def of
+                 LetExp mbTyp name funPolicy spEq e1 -> Tuple.mapFirst (\newE1 -> LetExp mbTyp name funPolicy spEq newE1) <| recurse acc e1
+                 LetType spaceBeforeType name funPolicy spEq tp -> (def, acc)
+                 LetTypeAlias spaceBeforeType spaceBeforeAlias name funPolicy spEq tp -> (def, acc)
+      in
+      let (newBody, newAcc3) = recurse newAcc2 body in
+      ret (ELet ws1 lettype (List.reverse newRevDefinitions) printOrder spaceBeforeIn newBody) newAcc3
 
     EColonType ws1 e1 ws2 tipe ws3 ->
       let (newE1, newAcc2) = recurse newAcc e1 in
       ret (EColonType ws1 newE1 ws2 tipe ws3) newAcc2
-
-    ETypeAlias ws1 pat tipe e1 ws2 ->
-      let (newE1, newAcc2) = recurse newAcc e1 in
-      ret (ETypeAlias ws1 pat tipe newE1 ws2) newAcc2
-
-    ETypeDef ws1 ident vars ws2 dcs e1 ws3 ->
-      let (newE1, newAcc2) = recurse newAcc e1 in
-      ret (ETypeDef ws1 ident vars ws2 dcs newE1 ws3) newAcc2
 
     EParens ws1 e pStyle ws2 ->
       let (newE, newAcc2) = recurse newAcc e in
@@ -928,13 +917,22 @@ mapFoldPatTopDown f initAcc p =
       let (newPsvalues, newAcc2)    = recurseAll newAcc (Utils.recordValues ps) in
       ret (PRecord ws1 (Utils.recordValuesMake ps newPsvalues) ws2) newAcc2
 
-    PAs ws1 ident ws2 pChild ->
-      let (newPChild, newAcc2) = recurse newAcc pChild in
-      ret (PAs ws1 ident ws2 newPChild) newAcc2
+    PAs ws1 pChild1 ws2 pChild2 ->
+      let (newPChild1, newAcc2) = recurse newAcc pChild1 in
+      let (newPChild2, newAcc3) = recurse newAcc2 pChild2 in
+      ret (PAs ws1 newPChild1 ws2 newPChild2) newAcc3
 
     PParens ws1 pChild ws2 ->
       let (newPChild, newAcc2) = recurse newAcc pChild in
       ret (PParens ws1 newPChild ws2) newAcc2
+
+    PColonType ws1 pChild ws2 tp      ->
+      let (newPChild, newAcc2) = recurse newAcc pChild in
+      ret (PColonType ws1 newPChild  ws2 tp) newAcc2
+
+    PApp ws1 e ps ->
+      let (newPs, newAcc2)  = recurseAll newAcc ps in
+      ret (PApp ws1 e newPs) newAcc2
 
 -- Nodes visited/replaced in top-down, left-to-right order.
 -- Includes user-defined scope information.
@@ -1026,20 +1024,6 @@ mapFoldExpTopDownWithScope f handleELet handleEFun handleCaseBranch initGlobalAc
       in
       ret (ECase ws1 newE1 newBranches ws2) newGlobalAcc3
 
-    ETypeCase ws1 e1 tbranches ws2 ->
-      let (newE1, newGlobalAcc2) = recurse newGlobalAcc initScopeTempAcc e1 in
-      let (newBranches, newGlobalAcc3) =
-        tbranches
-        |> List.foldl
-            (\tbranch (newBranches, globalAcc) ->
-              let (TBranch_ bws1 t ei bws2) = tbranch.val in
-              let (newEi, newGlobalAcc3) = recurse globalAcc initScopeTempAcc ei in
-              (newBranches ++ [{ tbranch | val = TBranch_ bws1 t newEi bws2 }], newGlobalAcc3)
-            )
-            ([], newGlobalAcc2)
-      in
-      ret (ETypeCase ws1 newE1 newBranches ws2) newGlobalAcc3
-
     EComment ws s e1 ->
       let (newE1, newGlobalAcc2) = recurse newGlobalAcc initScopeTempAcc e1 in
       ret (EComment ws s newE1) newGlobalAcc2
@@ -1048,31 +1032,23 @@ mapFoldExpTopDownWithScope f handleELet handleEFun handleCaseBranch initGlobalAc
       let (newE1, newGlobalAcc2) = recurse newGlobalAcc initScopeTempAcc e1 in
       ret (EOption ws1 s1 ws2 s2 newE1) newGlobalAcc2
 
-    ELet ws1 k isRec p ws2 e1 ws3 e2 ws4 ->
+    ELet ws1 lettype definitions printOrder spaceBeforeIn body ->
       let newScopeTempAcc = handleELet newE initScopeTempAcc in
-      let (newE1, newGlobalAcc2) =
-        if isRec
-        then recurse newGlobalAcc newScopeTempAcc e1
-        else recurse newGlobalAcc initScopeTempAcc e1
+      let (newRevDefinitions, newGlobalAcc2) = Utils.foldLeft
+              ([],      newGlobalAcc) definitions <|
+             \(accDefs, newGlobalAcc)    def ->
+                Tuple.mapFirst (\newDef -> newDef::accDefs) <|
+                 case def of
+                   LetExp mbTyp name funPolicy spEq e1-> Tuple.mapFirst (\newE1 -> LetExp mbTyp name funPolicy spEq newE1) <| recurse newGlobalAcc newScopeTempAcc e1
+                   LetType spaceBeforeType name funPolicy spEq tp -> (def, newGlobalAcc)
+                   LetTypeAlias spaceBeforeType spaceBeforeAlias name funPolicy spEq tp -> (def, newGlobalAcc)
       in
-      let (newE2, newGlobalAcc3) = recurse newGlobalAcc2 newScopeTempAcc e2 in
-      ret (ELet ws1 k isRec p ws2 newE1 ws3 newE2 ws4) newGlobalAcc3
-
-    ETyp ws1 pat tipe e1 ws2 ->
-      let (newE1, newGlobalAcc2) = recurse newGlobalAcc initScopeTempAcc e1 in
-      ret (ETyp ws1 pat tipe newE1 ws2) newGlobalAcc2
+      let (newBody, newGlobalAcc3) = recurse newGlobalAcc2 newScopeTempAcc body in
+      ret (ELet ws1 lettype (List.reverse newRevDefinitions) printOrder spaceBeforeIn newBody) newGlobalAcc3
 
     EColonType ws1 e1 ws2 tipe ws3 ->
       let (newE1, newGlobalAcc2) = recurse newGlobalAcc initScopeTempAcc e1 in
       ret (EColonType ws1 newE1 ws2 tipe ws3) newGlobalAcc2
-
-    ETypeAlias ws1 pat tipe e1 ws2 ->
-      let (newE1, newGlobalAcc2) = recurse newGlobalAcc initScopeTempAcc e1 in
-      ret (ETypeAlias ws1 pat tipe newE1 ws2) newGlobalAcc2
-
-    ETypeDef ws1 ident vars ws2 dcs e1 ws3 ->
-      let (newE1, newGlobalAcc2) = recurse newGlobalAcc initScopeTempAcc e1 in
-      ret (ETypeDef ws1 ident vars ws2 dcs newE1 ws3) newGlobalAcc2
 
     EParens ws1 e pStyle ws2 ->
       let (newE, newGlobalAcc2) = recurse newGlobalAcc initScopeTempAcc e in
@@ -1247,7 +1223,14 @@ mapPatNode pid f root =
   mapExpViaExp__
       (\e__ ->
         case e__ of
-          ELet ws1 kind isRec pat ws2 boundExp ws3 body ws4 -> ELet ws1 kind isRec (mapPatNodePat pid f pat) ws2 boundExp ws3 body ws4
+          ELet  ws1 lettype definitions printOrder spaceBeforeIn body ->
+            let newDefinitions = definitions |> List.map (\def -> case def of
+               LetExp mbTyp name funPolicy spEq e1 -> LetExp mbTyp (mapPatNodePat pid f name) funPolicy spEq e1
+               LetType spaceBeforeType name funPolicy spEq tp -> def
+               LetTypeAlias spaceBeforeType spaceBeforeAlias name funPolicy spEq tp -> def
+              )
+            in
+            ELet ws1 lettype newDefinitions printOrder spaceBeforeIn body
           EFun ws1 pats body ws2                            -> EFun ws1 (List.map (mapPatNodePat pid f) pats) body ws2
           ECase ws1 scrutinee branches ws2                  -> ECase ws1 scrutinee (mapBranchPats (mapPatNodePat pid f) branches) ws2
           _                                                 -> e__
@@ -1358,10 +1341,14 @@ findScopeExpAndPatByPId program targetPId =
       (\e ->
         let maybeTargetPat =
           case e.val.e__ of
-            ELet _ _ _ pat _ _ _ _ _ -> findPatInPat targetPId pat
-            EFun _ pats _ _          -> Utils.mapFirstSuccess (findPatInPat targetPId) pats
-            ECase _ _ branches _     -> Utils.mapFirstSuccess (findPatInPat targetPId) (branchPats branches)
-            _                        -> Nothing
+             ELet _ _ defs _ _ _      ->
+               defs |> Utils.mapFirstSuccess (\def -> case def of
+                 LetExp mbTyp pat funStyle sp0 e1 -> findPatInPat targetPId pat
+                 _ -> Nothing
+               )
+             EFun _ pats _ _          -> Utils.mapFirstSuccess (findPatInPat targetPId) pats
+             ECase _ _ branches _     -> Utils.mapFirstSuccess (findPatInPat targetPId) (branchPats branches)
+             _                        -> Nothing
         in
         maybeTargetPat |> Maybe.map (\pat -> (e, pat))
       )
@@ -1401,26 +1388,6 @@ findAllWithAncestors_ predicate ancestors exp =
   let thisResult       = if predicate exp then [ancestorsAndThis] else [] in
   let recurse exp      = findAllWithAncestors_ predicate ancestorsAndThis exp in
   thisResult ++ List.concatMap recurse (childExps exp)
-
--- Returns a boolean tag indicating whether the ancestor is a scope.
--- Most notably, a let is NOT a scope for its bound exp, only its body.
--- (An ECase is also NOT a scope for its scrutinee, but is for its branches.)
-findAllWithAncestorsScopesTagged : (Exp -> Bool) -> Exp -> List (List (Exp, Bool))
-findAllWithAncestorsScopesTagged predicate exp =
-  findAllWithAncestorsScopesTagged_ predicate [] exp
-
-findAllWithAncestorsScopesTagged_ : (Exp -> Bool) -> List (Exp, Bool) -> Exp -> List (List (Exp, Bool))
-findAllWithAncestorsScopesTagged_ predicate ancestors exp =
-  let ancestorsAndThisNoScope = ancestors ++ [(exp, False)] in
-  let ancestorsAndThisScope   = ancestors ++ [(exp, True)] in
-  let thisResult = if predicate exp then [ancestorsAndThisNoScope] else [] in
-  let recurseNoScope exp = findAllWithAncestorsScopesTagged_ predicate ancestorsAndThisNoScope exp in
-  let recurseScope exp   = findAllWithAncestorsScopesTagged_ predicate ancestorsAndThisScope exp in
-  case exp.val.e__ of
-    ELet _ _ _ _ _ boundExp _ body _ -> thisResult ++ recurseNoScope boundExp  ++ recurseScope body
-    ECase _ scrutinee branches _     -> thisResult ++ recurseNoScope scrutinee ++ List.concatMap recurseScope (branchExps branches)
-    EFun _ _ body _                  -> thisResult ++ recurseScope body
-    _                                -> thisResult ++ List.concatMap recurseNoScope (childExps exp)
 
 commonAncestors : (Exp -> Bool) -> Exp -> List Exp
 commonAncestors pred exp =
@@ -1479,22 +1446,32 @@ childExpsExtractors e =
          Nothing -> (Utils.recordValues es, multiArgExtractor "ERecord-unexp" e  <|  \newEs -> ERecord ws1 Nothing (Utils.recordValuesMake es newEs) ws2)
     ESelect sp0 e sp1 sp2 name       -> ([e], multiArgExtractor "ESelect-unexp" e <| \newEs -> ESelect sp0 (Utils.head "childExps-ESelect" newEs) sp1 sp2 name)
     EApp ws1 f es apptype ws2        -> (f :: es, multiArgExtractor "EApp-unexp" e <| \newEs -> EApp ws1 (Utils.head "childExps-EApp" newEs) (Utils.tail "childExps-Eapp" newEs) apptype ws2)
-    ELet ws1 k b p ws2 e1 ws3 e2 ws4 -> ([e1, e2], multiArgExtractor "ELet-unexp" e <| \newEs -> case newEs of
-      [newE1, newE2] -> ELet ws1 k b p ws2 newE1 ws3 newE2 ws4
-      _ -> Debug.crash "childExps-ELet")
+    ELet  ws1 lettype definitions printOrder spaceBeforeIn body ->
+      let (revDefExps, partialRevRebuilder) = Utils.foldLeft
+            ([],  \subexps -> ([], subexps)) definitions <|
+           \(exps, rebuilder) def -> case def of
+           LetExp mbTyp name funStyle spEq e1-> (e1::exps, \subExps -> case rebuilder subExps of
+             (definitions, newE1::tail) -> (LetExp mbTyp name funStyle spEq newE1::definitions, tail)
+             _ -> Debug.crash <| "[internal error] Unespected empty list for LetExp")
+           LetType spaceBeforeType name funStyle spEq tp ->
+             (exps, \subExps -> Tuple.mapFirst (\defs -> def::defs) (rebuilder subExps))
+           LetTypeAlias spaceBeforeType spaceBeforeAlias name funStyle spEq tp ->
+             (exps, \subExps -> Tuple.mapFirst (\defs -> def::defs) (rebuilder subExps))
+      in
+      (List.reverse (body::revDefExps), multiArgExtractor "ELet-unexp" e <| \newExps ->
+        let (newRevDefs, remaining) = partialRevRebuilder newExps in
+        case remaining of
+          [newBody] -> ELet  ws1 lettype (List.reverse newRevDefs) printOrder spaceBeforeIn newBody
+          _ -> Debug.crash <| "Expected exactly one remaining expression for the body of ELet, got " ++ toString (List.length remaining))
+
     EIf ws1 e1 ws2 e2 ws3 e3 ws4     -> ([e1, e2, e3], multiArgExtractor "EIf-unexp" e <| \newEs -> case newEs of
         [newE1, newE2, newE3] -> EIf ws1 newE1 ws2 newE2 ws3 newE3 ws4
         _ -> Debug.crash "childExps-EIf")
     ECase ws1 e branches ws2         -> let (es, esExtractor) = branchExpsExtractor branches in
       (e :: es, multiArgExtractor "ECase-unexp" e <| \newEs ->  ECase ws1 (Utils.head "childExps-ECase" newEs) (Utils.tail "childExps-ECAse" newEs |> esExtractor) ws2)
-    ETypeCase ws1 e tbranches ws2    -> let (es, esExtractor) = tbranchExpsExtractor tbranches in
-      (e :: es, multiArgExtractor "ETypeCase-unexp" e <| \newEs ->  ETypeCase ws1 (Utils.head "childExps-ECase" newEs) (Utils.tail "childExps-ECAse" newEs |> esExtractor) ws2)
     EComment ws s e1                 -> ([e1], singleArgExtractor "EComment-unexp" e <| \newE ->EComment ws s newE              )
     EOption ws1 s1 ws2 s2 e1         -> ([e1], singleArgExtractor "EOption-unexp" e <| \newE ->EOption ws1 s1 ws2 s2 newE      )
-    ETyp ws1 pat tipe e ws2          -> ([e], singleArgExtractor  "ETyp-unexp" e <| \newE -> ETyp ws1 pat tipe newE ws2      )
     EColonType ws1 e ws2 tipe ws3    -> ([e], singleArgExtractor  "EColonType-unexp" e <| \newE -> EColonType ws1 newE ws2 tipe ws3)
-    ETypeAlias ws1 pat tipe e ws2    -> ([e], singleArgExtractor  "ETypeAlias-unexp" e <| \newE -> ETypeAlias ws1 pat tipe newE ws2)
-    ETypeDef a1 a2 a3 a4 a5 e a6     -> ([e], singleArgExtractor  "ETypeDef-unexp" e <| \newE -> ETypeDef a1 a2 a3 a4 a5 newE a6 )
     EParens a1 e a2 a3               -> ([e], singleArgExtractor  "EParens-unexp" e <| \newE -> EParens a1 newE a2 a3)
     EHole _ _                        -> ([], \_ -> e)
 
@@ -1691,9 +1668,9 @@ isScope : Maybe Exp -> Exp -> Bool
 isScope maybeParent exp =
   let isObviouslyScope =
     case exp.val.e__ of
-      ELet _ _ _ _ _ _ _ _ _ -> True
-      EFun _ _ _ _           -> True
-      _                      -> False
+       ELet _ _ _ _ _ _  -> True
+       EFun _ _ _ _      -> True
+       _                 -> False
   in
   case maybeParent of
     Just parent ->
@@ -1730,16 +1707,8 @@ isOption exp =
 varsOfPat : Pat -> List Ident
 varsOfPat pat =
   case pat.val.p__ of
-    PConst _ _              -> []
-    PBase _ _               -> []
-    PWildcard _             -> []
     PVar _ x _              -> [x]
-    PList _ ps _ Nothing _  -> List.concatMap varsOfPat ps
-    PList _ ps _ (Just p) _ -> List.concatMap varsOfPat (p::ps)
-    PRecord _ ps _          -> List.concatMap varsOfPat <| Utils.recordValues ps
-    PAs _ x _ p             -> x::(varsOfPat p)
-    PParens _ p _           -> varsOfPat p
-
+    _ -> List.concatMap varsOfPat (childPats pat)
 
 flattenPatTree : Pat -> List Pat
 flattenPatTree pat =
@@ -1757,8 +1726,10 @@ childPats pat =
     PList _ ps _ Nothing _  -> ps
     PRecord _ ps _          -> Utils.recordValues ps
     PList _ ps _ (Just p) _ -> ps ++ [p]
-    PAs _ _ _ p             -> [p]
+    PAs _ p1 _ p2           -> [p1, p2]
     PParens _ p _           -> [p]
+    PColonType _ p _ _      -> [p]
+    PApp _ _ ps             -> ps
 
 -----------------------------------------------------------------------------
 -- Lang Options
@@ -1854,16 +1825,21 @@ clearPId p = setPId -1 p
 
 clearPIds p = mapPatTopDown clearPId p
 
+mapLetPats: (Pat -> Pat) -> LetExp -> LetExp
+mapLetPats f lk = case lk of
+  LetExp mbTyp name funStyle spEq e1-> LetExp (Maybe.map (\(TypeAnnotation name ws tp) ->
+      TypeAnnotation (f name) ws tp) mbTyp
+    ) (f name) funStyle spEq e1
+  LetType spType name funStyle spEq tp -> LetType spType (f name) funStyle spEq tp
+  LetTypeAlias spType spAlias name funStyle spEq tp -> LetTypeAlias spType spAlias (f name) funStyle spEq tp
+
 clearNodeIds e =
   let eidCleared = clearEId e in
   case eidCleared.val.e__ of
     EConst ws n (locId, annot, ident) wd  -> replaceE__ eidCleared (EConst ws n (0, annot, "") wd)
-    ELet ws1 kind b p ws2 e1 ws3 e2 ws4   -> replaceE__ eidCleared (ELet ws1 kind b (clearPIds p) ws2 e1 ws3 e2 ws4)
+    ELet ws1 letkind d printOrder s body  -> replaceE__ eidCleared (ELet ws1 letkind (List.map (mapLetPats clearPIds) d) printOrder s body)
     EFun ws1 pats body ws2                -> replaceE__ eidCleared (EFun ws1 (List.map clearPIds pats) body ws2)
     ECase ws1 scrutinee branches ws2      -> replaceE__ eidCleared (ECase ws1 scrutinee (mapBranchPats clearPIds branches) ws2)
-    ETypeCase ws1 scrutinee tbranches ws2 -> replaceE__ eidCleared (ETypeCase ws1 scrutinee tbranches ws2)
-    ETyp ws1 pat tipe e ws2               -> replaceE__ eidCleared (ETyp ws1 (clearPIds pat) tipe e ws2)
-    ETypeAlias ws1 pat tipe e ws2         -> replaceE__ eidCleared (ETypeAlias ws1 (clearPIds pat) tipe e ws2)
     _                                     -> eidCleared
 
 dummyLoc_ b = (0, b, "")
@@ -1936,7 +1912,7 @@ eLets xes eBody = case xes of
 eLetOrDef : LetKind -> List (Ident, Exp) -> Exp -> Exp
 eLetOrDef letKind namesAndAssigns bodyExp =
   let (pat, assign) = patBoundExpOf namesAndAssigns in
-  withDummyExpInfo <| ELet newline1 letKind False pat space1 assign space1 bodyExp space0
+  withDummyExpInfo <| ELet newline1 letKind [LetExp Nothing pat FunArgAsPats space1 assign] [0] space1 bodyExp
 
 patBoundExpOf : List (Ident, Exp) -> (Pat, Exp)
 patBoundExpOf namesAndAssigns =
@@ -1974,13 +1950,13 @@ pVar0 a        = withDummyPatInfo <| PVar space0 a noWidgetDecl
 pVar a         = withDummyPatInfo <| PVar space1 a noWidgetDecl
 pList0 ps      = withDummyPatInfo <| PList space0 ps space0 Nothing space0
 pList ps       = withDummyPatInfo <| PList space1 ps space0 Nothing space0
-pAs x p        = withDummyPatInfo <| PAs space1 x space1 p
+pAs x p        = withDummyPatInfo <| PAs space1 p space1 (withDummyPatInfo <| PVar space1 x noWidgetDecl)
 
 pListOfPVars names = pList (listOfPVars names)
 
 eLetUnapply: Exp -> Maybe ((Ident, Exp), Exp)
 eLetUnapply e = case e.val.e__ of
-  ELet _ _ False p _ assign _ bodyExp _ ->
+  ELet _ _ [(LetExp _ p _ _ assign)] _ _ bodyExp ->
     case p.val.p__ of
       PVar _ ident _ -> Just ((ident, assign), bodyExp)
       _ -> Nothing
@@ -2176,19 +2152,22 @@ indentationAt eid program =
     Nothing ->
       ""
 
-
 precedingWhitespacePat : Pat -> String
-precedingWhitespacePat pat =
-  .val <|
-    case pat.val.p__ of
-      PVar   ws ident wd         -> ws
-      PConst ws n                -> ws
-      PBase  ws v                -> ws
-      PWildcard ws               -> ws
-      PList  ws1 ps ws2 rest ws3 -> ws1
-      PRecord ws1 es ws2      -> ws1
-      PAs    ws1 ident ws2 p     -> ws1
-      PParens ws1 p ws2          -> ws1
+precedingWhitespacePat pat = .val <| precedingWhitespaceWithInfoPat pat
+
+precedingWhitespaceWithInfoPat : Pat -> WS
+precedingWhitespaceWithInfoPat pat =
+  case pat.val.p__ of
+    PVar   ws1 ident wd        -> ws1
+    PConst ws1 n               -> ws1
+    PBase  ws1 v               -> ws1
+    PWildcard ws1              -> ws1
+    PList  ws1 ps ws2 rest ws3 -> ws1
+    PRecord ws1 es ws2         -> ws1
+    PAs    ws1 p1 ws2 p2       -> ws1
+    PParens ws1 p ws2          -> ws1
+    PColonType ws1 p ws t      -> ws1
+    PApp ws1 e ps              -> ws1
 
 precedingWhitespaceWithInfoExp : Exp -> WS
 precedingWhitespaceWithInfoExp e =
@@ -2212,15 +2191,11 @@ precedingWhitespaceWithInfoExp__ e__ =
     ESelect    ws1 e ws2 ws3 s                  -> ws1
     EOp        ws1 op es ws2                    -> ws1
     EIf        ws1 e1 ws2 e2 ws3 e3 ws4         -> ws1
-    ELet       ws1 kind rec p ws2 e1 ws3 e2 ws4 -> ws1
+    ELet       ws1 kind ds po ws body           -> ws1
     ECase      ws1 e1 bs ws2                    -> ws1
-    ETypeCase  ws1 e1 bs ws2                    -> ws1
     EComment   ws s e1                          -> ws
     EOption    ws1 s1 ws2 s2 e1                 -> ws1
-    ETyp       ws1 pat tipe e ws2               -> ws1
     EColonType ws1 e ws2 tipe ws3               -> ws1
-    ETypeAlias ws1 pat tipe e ws2               -> ws1
-    ETypeDef   ws1 ident vars ws2 dcs rest ws3  -> ws1
     EParens    ws1 e pStyle ws2                 -> ws1
     EHole      ws mv                            -> ws
 
@@ -2263,33 +2238,17 @@ allWhitespaces_ exp =
                                                  ++ [ws2] ++ allWhitespaces_ e2
                                                  ++ [ws3] ++ allWhitespaces_ e3
                                                  ++ [ws4]
-    ELet       ws1 kind rec p ws2 e1 ws3 e2 ws4 -> [ws1]
-                                                     ++ allWhitespacesPat_ p
-                                                     ++ [ws2]
-                                                     ++ allWhitespaces_ e1
-                                                     ++ [ws3]
-                                                     ++ allWhitespaces_ e2
-                                                     ++ [ws4]
+    ELet        ws1 kind ds po ws2 body     -> [ws1] ++ List.concatMap (\def -> case def of
+        LetExp mbTyp name funStyle spEq e1                ->
+          (Maybe.map (\(TypeAnnotation p ws t) -> allWhitespacesPat_ p ++ [ws] ++ allWhitespacesType_ t) mbTyp |> Maybe.withDefault []) ++
+          allWhitespacesPat_ name ++ [spEq] ++ allWhitespaces_ e1
+        LetType spType name funStyle spEq tp              -> [spType] ++ allWhitespacesPat_ name ++ [spEq] ++ allWhitespacesType_ tp
+        LetTypeAlias spType spAlias name funStyle spEq tp -> [spType, spAlias] ++ allWhitespacesPat_ name ++ [spEq] ++ allWhitespacesType_ tp
+       ) ds ++ [ws2] ++ allWhitespaces_ body
     ECase      ws1 e1 bs ws2                -> [ws1] ++ allWhitespaces_ e1 ++ List.concatMap allWhitespacesBranch bs ++ [ws2]
-    ETypeCase  ws1 e1 bs ws2                -> [ws1] ++ allWhitespaces_ e1 ++ List.concatMap allWhitespacesTBranch bs ++ [ws2]
     EComment   ws s e1                      -> [ws] ++ allWhitespaces_ e1
     EOption    ws1 s1 ws2 s2 e1             -> [ws1, ws2] ++ allWhitespaces_ e1
-    ETyp       ws1 pat tipe e ws2           -> [ws1] ++ allWhitespacesPat_ pat ++ allWhitespacesType_ tipe ++ allWhitespaces_ e ++ [ws2]
     EColonType ws1 e ws2 tipe ws3           -> [ws1] ++ allWhitespaces_ e ++ [ws2] ++ allWhitespacesType_ tipe ++ [ws2]
-    ETypeAlias ws1 pat tipe e ws2           -> [ws1] ++ allWhitespacesPat_ pat ++ allWhitespacesType_ tipe ++ allWhitespaces_ e ++ [ws2]
-    ETypeDef ws1 (wsBeforeIdent, ident)
-             vars ws2 dcs rest ws3          -> [ws1, wsBeforeIdent] ++
-                                                 List.map Tuple.first vars ++
-                                                 [ws2] ++
-                                                 List.concatMap
-                                                   ( \(dcws1, _, ts, dcws2) ->
-                                                       [dcws1] ++
-                                                         List.concatMap allWhitespacesType_ ts ++
-                                                         [dcws2]
-                                                   )
-                                                   dcs ++
-                                                 allWhitespaces_ rest ++
-                                                 [ws3]
     EParens    ws1 e pStyle ws2             -> [ws1] ++ allWhitespaces_ e ++ [ws2]
     EHole      ws mv                        -> [ws]
 
@@ -2308,15 +2267,17 @@ allWhitespacesPat_ pat =
     PWildcard ws               -> [ws]
     PList  ws1 ps ws2 rest ws3 -> [ws1] ++ List.concatMap allWhitespacesPat_ ps ++ [ws2] ++ (rest |> Maybe.map allWhitespacesPat_ |> Maybe.withDefault []) ++ [ws3]
     PRecord ws1 ps ws2         -> [ws1] ++ List.concatMap allWhitespacesPat_ (Utils.recordValues ps) ++ [ws2]
-    PAs    ws1 ident ws2 p     -> [ws1, ws2] ++ allWhitespacesPat_ p
+    PAs    ws1 p1 ws2 p2       -> [ws1] ++ allWhitespacesPat_ p1 ++ [ws2] ++ allWhitespacesPat_ p2
     PParens ws1 p ws2          -> [ws1, ws2] ++ allWhitespacesPat_ p
+    PColonType ws1 p ws t      -> [ws1] ++ allWhitespacesPat_ p ++ [ws] ++ allWhitespacesType_ t
+    PApp ws1 e ps              -> [ws1] ++ allWhitespaces_ e ++ List.concatMap allWhitespacesPat_ ps
 
 allWhitespacesType_ : Type -> List WS
 allWhitespacesType_ tipe =
   let allWhitespacesForAllInner oneOrMany =
     case oneOrMany of
-      One (ws, ident) -> [ws]
-      Many ws1 inner ws2 -> [ws1] ++ List.map (\(ws, ident) -> ws) inner ++ [ws2]
+       One (ws, ident) -> [ws]
+       Many ws1 inner ws2 -> [ws1] ++ List.map (\(ws, ident) -> ws) inner ++ [ws2]
   in
     case tipe.val of
       TNum ws                             -> [ws]
@@ -2361,13 +2322,17 @@ copyPrecedingWhitespacePat : Pat -> Pat -> Pat
 copyPrecedingWhitespacePat source target =
   replacePrecedingWhitespacePat (precedingWhitespacePat source) target
 
-
--- Does not recurse.
 mapPrecedingWhitespace : (String -> String) -> Exp -> Exp
 mapPrecedingWhitespace stringMap exp =
   let
-    mapWs s =
-      ws (stringMap s.val)
+      mapWs s =
+        ws (stringMap s.val)
+  in mapPrecedingWhitespaceWS mapWs exp
+
+-- Does not recurse.
+mapPrecedingWhitespaceWS : (WS -> WS) -> Exp -> Exp
+mapPrecedingWhitespaceWS mapWs exp =
+  let
     e__New =
       case exp.val.e__ of
         EBase      ws v                             -> EBase      (mapWs ws) v
@@ -2380,26 +2345,26 @@ mapPrecedingWhitespace stringMap exp =
         ESelect    ws1 e ws2 ws3 s                  -> ESelect    (mapWs ws1) e ws2 ws3 s
         EOp        ws1 op es ws2                    -> EOp        (mapWs ws1) op es ws2
         EIf        ws1 e1 ws2 e2 ws3 e3 ws4         -> EIf        (mapWs ws1) e1 ws2 e2 ws3 e3 ws4
-        ELet       ws1 kind rec p ws2 e1 ws3 e2 ws4 -> ELet       (mapWs ws1) kind rec p ws2 e1 ws3 e2 ws4
+        ELet       ws1 kind ds po ws2 body          -> ELet       (mapWs ws1) kind ds po ws2 body
         ECase      ws1 e1 bs ws2                    -> ECase      (mapWs ws1) e1 bs ws2
-        ETypeCase  ws1 e1 bs ws2                    -> ETypeCase  (mapWs ws1) e1 bs ws2
         EComment   ws s e1                          -> EComment   (mapWs ws) s e1
         EOption    ws1 s1 ws2 s2 e1                 -> EOption    (mapWs ws1) s1 ws2 s2 e1
-        ETyp       ws1 pat tipe e ws2               -> ETyp       (mapWs ws1) pat tipe e ws2
         EColonType ws1 e ws2 tipe ws3               -> EColonType (mapWs ws1) e ws2 tipe ws3
-        ETypeAlias ws1 pat tipe e ws2               -> ETypeAlias (mapWs ws1) pat tipe e ws2
-        ETypeDef   ws1 ident vars ws2 dcs rest ws3  -> ETypeDef   (mapWs ws1) ident vars ws2 dcs rest ws3
         EParens    ws e pStyle ws2                  -> EParens    (mapWs ws) e pStyle ws2
         EHole      ws mv                            -> EHole      (mapWs ws) mv
   in
     replaceE__ exp e__New
 
-
 mapPrecedingWhitespacePat : (String -> String) -> Pat -> Pat
 mapPrecedingWhitespacePat stringMap pat =
   let
-    mapWs s =
-      ws (stringMap s.val)
+      mapWs s =
+        ws (stringMap s.val)
+  in  mapPrecedingWhitespacePatWS mapWs pat
+
+mapPrecedingWhitespacePatWS : (WS -> WS) -> Pat -> Pat
+mapPrecedingWhitespacePatWS mapWs pat =
+  let
     p__ =
       case pat.val.p__ of
         PVar   ws ident wd         -> PVar   (mapWs ws) ident wd
@@ -2408,8 +2373,10 @@ mapPrecedingWhitespacePat stringMap pat =
         PWildcard ws               -> PWildcard (mapWs ws)
         PList  ws1 ps ws2 rest ws3 -> PList  (mapWs ws1) ps ws2 rest ws3
         PRecord ws1 ps ws2         -> PRecord (mapWs ws1) ps ws2
-        PAs    ws1 ident ws2 p     -> PAs    ws1 ident ws2 (mapPrecedingWhitespacePat stringMap p)
+        PAs    ws1 p1 ws2 p2       -> PAs    (mapWs ws1) p1 ws2 p2
         PParens ws1 p ws2          -> PParens (mapWs ws1) p ws2
+        PColonType ws1 p ws2 tp    -> PColonType (mapWs ws1) p ws2 tp
+        PApp ws1 e ps              -> PApp (mapWs ws1) e ps
   in
     replaceP__ pat p__
 
@@ -2759,25 +2726,7 @@ wsBefore codeObject =
   case codeObject of
     E e ->
       precedingWhitespaceWithInfoExp__ e.val.e__
-
-    P e p ->
-      case p.val.p__ of
-        PVar ws _ _ ->
-          ws
-        PConst ws _ ->
-          ws
-        PBase ws _ ->
-          ws
-        PWildcard ws ->
-          ws
-        PList ws _ _ _ _ ->
-          ws
-        PRecord ws _ _ ->
-          ws
-        PAs _ _ _ p ->
-          wsBefore <| P e p
-        PParens ws _ _ ->
-          ws
+    P e p -> precedingWhitespaceWithInfoPat p
     T t ->
       case t.val of
         TNum ws ->
@@ -2830,76 +2779,14 @@ modifyWsBefore f codeObject =
       let
         eVal =
           e.val
-        newE__ =
-          case eVal.e__ of
-            EConst ws a b c ->
-              EConst (f ws) a b c
-            EBase ws a ->
-              EBase (f ws) a
-            EVar ws a ->
-              EVar (f ws) a
-            EFun ws a b c ->
-              EFun (f ws) a b c
-            EApp ws a b c d ->
-              EApp (f ws) a b c d
-            EOp ws a b c ->
-              EOp (f ws) a b c
-            EList ws a b c d ->
-              EList (f ws) a b c d
-            ERecord ws a b c ->
-              ERecord (f ws) a b c
-            ESelect ws a b c d ->
-              ESelect (f ws) a b c d
-            EIf ws a b c d e_ f_ ->
-              EIf (f ws) a b c d e_ f_
-            ECase ws a b c  ->
-              ECase (f ws) a b c
-            ETypeCase ws a b c ->
-              ETypeCase (f ws) a b c
-            ELet ws a b c d e_ f_ g h ->
-              ELet (f ws) a b c d e_ f_ g h
-            EComment ws a b ->
-              EComment (f ws) a b
-            EOption ws a b c d ->
-              EOption (f ws) a b c d
-            ETyp ws a b c d  ->
-              ETyp (f ws) a b c d
-            EColonType ws a b c d ->
-              EColonType (f ws) a b c d
-            ETypeAlias ws a b c d ->
-              ETypeAlias (f ws) a b c d
-            ETypeDef ws a b c d e_ f_ ->
-              ETypeDef (f ws) a b c d e_ f_
-            EParens ws a pStyle b ->
-              EParens (f ws) a pStyle b
-            EHole ws mv ->
-              EHole (f ws) mv
+        newE__ = (mapPrecedingWhitespaceWS f e).val.e__
       in
         E { e | val = { eVal | e__ = newE__ } }
     P e p ->
       let
         pVal =
           p.val
-        newP__ =
-          case pVal.p__ of
-            PVar ws a b ->
-              PVar (f ws) a b
-            PConst ws a ->
-              PConst (f ws) a
-            PBase ws a ->
-              PBase (f ws) a
-            PWildcard ws ->
-              PWildcard (f ws)
-            PList ws a b c d ->
-              PList (f ws) a b c d
-            PRecord ws a b ->
-              PRecord (f ws) a b
-            PAs ws ident ws2 p2 ->
-              case modifyWsBefore f (P e p2) of
-                P e3 p3 -> PAs ws ident ws2 p3
-                _ -> Debug.crash "Internal error: modifyWsBefore cannot return something else than P if provided with P"
-            PParens ws p2 ws2 ->
-              PParens (f ws) p2 ws2
+        newP__ = (mapPrecedingWhitespacePatWS f p).val.p__
       in
         P e { p | val = { pVal | p__ = newP__ } }
     T t ->
@@ -2947,15 +2834,9 @@ modifyWsBefore f codeObject =
 
 isImplicitMain : Exp -> Bool
 isImplicitMain e =
-  case e.val.e__ of
-    ELet _ _ _ name _ _ _ _ _ ->
-      case name.val.p__ of
-        PVar _ "_IMPLICIT_MAIN" _ ->
-          True
-        _ ->
-          False
-    _ ->
-      False
+  case eLetUnapply e of
+    Just (("_IMPLICIT_MAIN", _), _) -> True
+    _ -> False
 
 isHiddenCodeObject : CodeObject -> Bool
 isHiddenCodeObject codeObject =
@@ -3090,107 +2971,93 @@ childCodeObjects co =
                 )
                 branches
             )
-          ETypeCase ws1 e1 tbranches _ ->
+          ELet ws1 letType defs _ ws3 e2 ->
             [ ET Before ws1 e
-            , E e1
-            ] ++
-            ( case List.head tbranches of
-                Just tb ->
-                  case tb.val of
-                    TBranch_ tbranchWS1 _ _ _ ->
-                      [ ET After tbranchWS1 e1 ]
-                Nothing ->
-                  []
-            ) ++
-            ( List.concatMap
-                ( .val >> \(TBranch_ _ branchT branchE branchWS2) ->
-                    [ T branchT
-                    , E branchE
-                    , ET After branchWS2 branchE
+            , LBE
+                { start = e.start
+                , end =
+                    if letType == Def then
+                      e.end
+                    else
+                      Utils.last "ELet-codeObject-last" defs |> endPosLetExp
+                , val =
+                    e.val.eid
+                }
+            ] ++ (
+            defs |> List.concatMap (\def ->
+            case def of
+              LetType spType p1 funPolicy spEq tp ->
+                [T tp ]
+              LetTypeAlias spType spAlias p1 funPolicy spEq t1 ->
+                [ P e p1
+                , T t1
+                , TT After (withInfo "" t1.end t1.end) t1
+                ]
+              LetExp mbTyp p1 ws2 funStyle e1 ->
+                (case mbTyp of
+                  Nothing -> []
+                  Just (TypeAnnotation p1 ws2 t1) ->
+                    [ P e p1
+                    , T t1
+                    , TT After ws2 t1
                     ]
-                )
-                tbranches
-            )
-          ELet ws1 lk _ p1 ws2 e1 ws3 e2 ws4 ->
-            let
-              -- Altered Whitespace
-              --
-              -- In the following example little programs, * represents special1
-              -- and ~ represents special2. Note that (+ 2 3) is e1.
-              --
-              -- Case 1:
-              --   (def x*(+ 2 3))
-              --
-              -- Case 2:
-              --   (def x******
-              --   ~~~~(+ 2 3))
-              (special1, special2) =
+                ) ++
                 let
-                  e1Ws =
-                    wsBefore << E <| e1
-                in
-                  -- Case 1
-                  if e1Ws.start.line == e1Ws.end.line then
-                    ( e1Ws
-                    , withDummyInfo ""
-                    )
-                  -- Case 2
-                  else
+                  -- Altered Whitespace
+                  --
+                  -- In the following example little programs, * represents special1
+                  -- and ~ represents special2. Note that (+ 2 3) is e1.
+                  --
+                  -- Case 1:
+                  --   (def x*(+ 2 3))   or   let x =*2 + 3 in
+                  --
+                  -- Case 2:
+                  --   (def x******      or   let x =*****
+                  --   ~~~~(+ 2 3))           ~~~~2 + 3 in
+                  (special1, special2) =
                     let
-                      breakpoint =
-                        { line =
-                            e1Ws.start.line + 1
-                          , col =
-                              1
-                        }
+                      e1Ws =
+                        wsBefore << E <| e1
                     in
-                      -- Note that col = 0 makes the Deuce polygon renderer extend
-                      -- the polygon to maxCol (desired).
-                      ( { e1Ws | end = { breakpoint | col = 0 } }
-                      , { e1Ws | start = breakpoint }
-                      )
-            in
-              [ ET Before ws1 e
-              , LBE
-                  -- TODO LBE Bounds
-                  { start =
-                      { line =
-                          e.start.line
-                      , col =
-                          -- TODO Make this work well with both Elm and Little.
-                          -- We'd like to have something like:
-                          --
-                          --   if syntax == Syntax.Little && lk == Let then
-                          --     e.start.col + 1
-                          --   else
-                          --     e.start.col
-                          --
-                          -- But this function doesn't know about syntax (yet)
-                            e.start.col
-                      }
-                  , end =
-                      if lk == Def then
-                        e.end
+                      -- Case 1
+                      if e1Ws.start.line == e1Ws.end.line then
+                        ( e1Ws
+                        , withDummyInfo ""
+                        )
+                      -- Case 2
                       else
-                        e1.end
-                  , val =
-                      e.val.eid
-                  }
-              , P e p1
-              , PT After special1 e p1
-              , E e1
-                  |> modifyWsBefore (always special2)
-              ] ++
-              ( case lk of
-                  Let ->
-                    [ E e2
-                    , ET After ws4 e2
-                    ]
-                  Def ->
-                    [ ET After ws4 e1
-                    , E e2
-                    ]
-              )
+                        let
+                          breakpoint =
+                            { line =
+                                e1Ws.start.line + 1
+                              , col =
+                                  1
+                            }
+                        in
+                          -- Note that col = 0 makes the Deuce polygon renderer extend
+                          -- the polygon to maxCol (desired).
+                          ( { e1Ws | end = { breakpoint | col = 0 } }
+                          , { e1Ws | start = breakpoint }
+                          )
+                in
+                  [ P e p1
+                  , PT After special1 e p1
+                  , E e1
+                      |> modifyWsBefore (always special2)
+                  ] ++  ( case letType of
+                      Let ->
+                        [ ]
+                      Def ->
+                        [ ET After (withInfo "" e1.end e1.end) e1]
+                  )
+                  )) ++ ( case letType of
+                      Let ->
+                        [ E e2
+                        , ET After (withInfo "" e2.end e2.end) e2
+                        ]
+                      Def ->
+                        [ E e2 ]
+                  )
           EComment ws1 _ e1 ->
             [ ET Before ws1 e
             , E e1
@@ -3199,33 +3066,9 @@ childCodeObjects co =
             [ ET Before ws1 e
             , E e1
             ]
-          ETyp ws1 p1 t1 e1 ws2 ->
-            [ ET Before ws1 e
-            , P e p1
-            , T t1
-            , TT After ws2 t1
-            , E e1
-            ]
           EColonType _ e1 _ t1 _ ->
             [E e1, T t1]
-          ETypeAlias ws1 p1 t1 e1 ws2 ->
-            [ ET Before ws1 e
-            , P e p1
-            , T t1
-            , TT After ws2 t1
-            , E e1
-            ]
-          ETypeDef ws1 ident vars ws2 dcs e1 ws3 ->
-            [ ET Before ws1 e
-            ] ++
-            ( List.concatMap
-                ( \(_, _, ts, _) ->
-                    List.map T ts
-                )
-                dcs
-            ) ++
-            [ E e1
-            ]
+
           EParens ws1 e1 pStyle ws2 ->
             [ ET Before ws1 e
             , E e1
@@ -3282,14 +3125,24 @@ childCodeObjects co =
               ++
               ( List.map (PT After ws2 e) lastHead
               )
-          PAs ws1 _ _ p1 ->
+          PAs ws1 p1 _ p2 ->
             [ PT Before ws1 e p
             , P e p1
+            , P e p2
             ]
           PParens ws1 p1 ws2 ->
             [ PT Before ws1 e p1
             , P e p1
             , PT After ws2 e p1 ]
+          PColonType ws1 p1 _ t ->
+            [ PT Before ws1 e p
+            , P e p1
+            , T t
+            ]
+          PApp ws1 e1 ps ->
+            [ PT Before ws1 e p
+            , E e1
+            ] ++ List.map (P e) ps
       T t ->
         case t.val of
           TNum ws1 ->
@@ -3469,6 +3322,10 @@ tagSinglePat ppid pat =
           tagSinglePat ppid p1
         PRecord ws1 listWsIdWsExpWs ws2 ->
           tagPatList ppid (Utils.recordValues listWsIdWsExpWs)
+        PColonType _ p1 _ _ ->
+          tagSinglePat ppid p1
+        PApp _ e ps ->
+          tagPatList ppid ps
 
 tagBranchList
   :  EId
@@ -3483,6 +3340,7 @@ tagBranchList eid =
               tagSinglePat (rootPathedPatternId (eid, index + 1)) p
       )
 
+-- Return the tags of the patterns of this current expression (not the children)
 taggedExpPats : Exp -> List (PId, PathedPatternId)
 taggedExpPats exp =
   case exp.val.e__ of
@@ -3490,12 +3348,18 @@ taggedExpPats exp =
       tagPatList (rootPathedPatternId (exp.val.eid, 1)) ps
     ECase _ _ branches _ ->
       tagBranchList exp.val.eid branches
-    ELet _ _ _ p1 _ _ _ _ _ ->
-      tagSinglePat (rootPathedPatternId (exp.val.eid, 1)) p1
-    ETyp _ p1 _ _ _ ->
-      tagSinglePat (rootPathedPatternId (exp.val.eid, 1)) p1
-    ETypeAlias _ p1 _ _ _ ->
-      tagSinglePat (rootPathedPatternId (exp.val.eid, 1)) p1
+    ELet _ _ defs  _ _ _ ->
+      List.concatMap (\def -> case def of
+        LetExp Nothing p1 _ _ _ ->
+          tagSinglePat (rootPathedPatternId (exp.val.eid, 1)) p1
+        LetExp (Just (TypeAnnotation p0 _ _)) p1 _ _ _ ->
+          tagSinglePat (rootPathedPatternId (exp.val.eid, 1)) p0 ++
+          tagSinglePat (rootPathedPatternId (exp.val.eid, 1)) p1
+        LetType _ p1 _ _ _ ->
+          tagSinglePat (rootPathedPatternId (exp.val.eid, 1)) p1
+        LetTypeAlias _ _ p1 _ _ _ ->
+          tagSinglePat (rootPathedPatternId (exp.val.eid, 1)) p1
+      ) defs
     _ ->
       []
 
@@ -3516,15 +3380,11 @@ pidToPathedPatternId program pid =
 firstNestedExp : Exp -> Exp
 firstNestedExp e =
   case e.val.e__ of
-    ELet _ Def _ _ _ _ _ eRest _ ->
+    ELet _ Def _ _ _ eRest ->
       firstNestedExp eRest
     EComment _ _ eRest ->
       firstNestedExp eRest
     EOption _ _ _ _ eRest ->
-      firstNestedExp eRest
-    ETyp _ _ _ eRest _ ->
-      firstNestedExp eRest
-    ETypeAlias _ _ _ eRest _ ->
       firstNestedExp eRest
     _ ->
       e
