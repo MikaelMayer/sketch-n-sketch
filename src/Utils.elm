@@ -1410,3 +1410,120 @@ reorder order elements =
        aux tailOrder
   in
   aux order []
+
+tarjan nodes edgesByNode =
+  let index = 0 in
+  let s = [] in
+  let vindex = Dict.empty in
+  let lowlink = Dict.empty in
+  let onstack = Dict.empty in
+  let components = [] in
+  let strongConnect v (index, vindex, lowlink, onstack, s, components) =
+    let nvindex = Dict.insert v index vindex in
+    let nlowlink = Dict.insert v index lowlink in
+    let nindex = index + 1 in
+    let ns = v :: s in
+    let nonstack = Dict.insert v True onstack in
+
+    let outEdges = Dict.get v edgesByNode |> Maybe.withDefault [] in
+    (foldLeft (nindex, nvindex, nlowlink, nonstack, ns, components) outEdges <|
+            \(index, vindex, lowlink, onstack, s, components) w ->
+       if Dict.get w vindex == Nothing then
+         strongConnect w (index, vindex, lowlink, onstack, s, components) |> (\(index, vindex, lowlink, onstack, s, components) ->
+         Dict.insert v (min (Dict.get v lowlink |> Maybe.withDefault 0) (Dict.get w lowlink |> Maybe.withDefault 0)) lowlink |> (\lowlink ->
+           (index, vindex, lowlink, onstack, s, components)
+         ))
+       else if Dict.get w onstack |> Maybe.withDefault False then
+         Dict.insert v (min (Dict.get v lowlink |> Maybe.withDefault 0) (Dict.get w vindex |> Maybe.withDefault 0)) lowlink |> (\lowlink ->
+           (index, vindex, lowlink, onstack, s, components)
+         )
+       else
+         (index, vindex, lowlink, onstack, s, components)
+    ) |> (\(index, vindex, lowlink, onstack, s, components) ->
+    if Dict.get v lowlink == Dict.get v vindex then
+       let aux (s, onstack) acc = case s of
+        [] -> Debug.crash "Tarjan empty should not happen"
+        w :: s2 ->
+          if w == v then
+            ((w::acc):: components, s, onstack)
+          else
+            (w::acc) |>
+            aux (s2, Dict.insert w False onstack)
+       in
+       aux (s, onstack) [] |> (\(component, s, onstack) ->
+        (index, vindex, lowlink, onstack, s, components)
+       )
+    else
+       (index, vindex, lowlink, onstack, s, components)
+    )
+  in
+  (foldLeft (index, vindex, lowlink, onstack, s, components) nodes <|
+          \(index, vindex, lowlink, onstack, s, components) v ->
+            if Dict.get v vindex == Nothing then
+              strongConnect v (index, vindex, lowlink, onstack, s, components)
+            else
+              (index, vindex, lowlink, onstack, s, components)
+  ) |> \(index, vindex, lowlink, onstack, s, components) ->
+    components
+
+
+-- Given a list declaring names and dependencies,
+-- reorders the list so that dependencies are satisfied. If it cannot, returns an error message explaining why.
+
+orderWithDependencies: List a -> (a -> (Set String, Set String)) -> (a -> String) -> Result String (List a)
+orderWithDependencies elements elemToNamesDependencies elemToNameDisplay =
+   let isDependencySatisfied: Set String -> Set String -> Bool
+       isDependencySatisfied deps previousNames = (Set.diff deps previousNames) |> Set.isEmpty
+
+       correctDependenciesWONotResolved: List a -> Set String -> List a -> (List a, List a)
+       correctDependenciesWONotResolved  input     previousNames notResolved =
+         case input of
+           [] -> ([], notResolved)
+           head :: tailInput ->
+             let (names, deps) = elemToNamesDependencies head in
+             if isDependencySatisfied deps previousNames then
+               let (nextCorrect, notCorrect) = correctDependencies tailInput (Set.union previousNames names) notResolved in
+               (head :: nextCorrect, notCorrect)
+             else
+               correctDependenciesWONotResolved tailInput previousNames (notResolved ++ [head])
+
+       correctDependencies: List a -> Set String -> List a -> (List a, List a)
+       correctDependencies input previousNames notResolved =
+         let (solvable, unsolvable) = notResolved |> List.partition (\a ->
+              let (names, deps) = elemToNamesDependencies a in
+              isDependencySatisfied deps previousNames
+           )
+         in
+         if List.isEmpty solvable then
+           correctDependenciesWONotResolved input previousNames notResolved
+         else
+           let solvableNames = solvable |> List.concatMap (elemToNamesDependencies >> Tuple.first >> Set.toList) |> Set.fromList in
+           let (nextCorrect, notCorrect) = correctDependencies input (Set.union previousNames solvableNames) unsolvable in
+           (solvable ++ nextCorrect, notCorrect)
+
+       smallestCycle: List a -> Maybe (List a)
+       smallestCycle notResolved =
+
+         let nodes = notResolved |> Set.fromList in
+         -- For each name, it gives a list of possible nodes refering to this name.
+         let nodesByName = notResolved |> List.concatMap (\x -> elemToNamesDependencies x |> Tuple.first |> Set.toList |> List.map (\name -> (name, x))) |>
+           groupBy (\(name, target) -> name) in
+         -- For each node, it gives a list of nodes it depends on.
+         let edges = notResolved |> List.map (\x -> (x,
+           elemToNamesDependencies x |> Tuple.second |>  Set.toList |>List.filterMap (flip Dict.get nodesByName))) |> Dict.fromList in
+         case tarjan nodes edges of
+           [] -> Nothing
+           head :: _ -> Just head
+
+   in
+   case correctDependencies elements Set.empty [] of
+     (result, []) -> Ok result
+     (result, notResolved) ->
+       case smallestCycle notResolved of
+         Nothing -> Ok (result ++ notResolved) -- Let's leave it to the type checker.
+         Just cycle ->
+           Err <| "Cycle in explicit dependencies not allowed:\n    ┌─────┐" ++ (cycle |>
+            List.map (\a ->
+              let nameDisplay = elemToNameDisplay a in
+              "\n    |    " ++ nameDisplay) |> String.join "\n    |     |"
+           ) ++ "\n    └─────┘\n\nHint: An explicit dependency happens when a variable is not bound by a lambda."

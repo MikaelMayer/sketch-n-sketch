@@ -27,6 +27,7 @@ import Parser.LanguageKit as LK
 
 import ParserUtils exposing (..)
 import LangParserUtils exposing (..)
+import LangUtils
 import BinaryOperatorParser exposing (..)
 import Utils
 
@@ -39,6 +40,7 @@ import PreludeGenerated as Prelude
 import Regex
 import HTMLParser
 import ImpureGoodies
+import Array
 
 --==============================================================================
 --= Helpers
@@ -1971,13 +1973,28 @@ letExp sp =
            |= expression { sp | first = spaces }
        ))
 
-willSurelyProduceClosure: Exp -> Bool
-willSurelyProduceClosure e = case e.val.e__ of
-  EFun _ _ _ _ -> True
-  ELet _ _ _ _ _ e -> willSurelyProduceClosure e
-  _ -> False
+-- Given an expression, returns the set of variables needed to compute it immediately.
+-- compulsoryDependencies (\x -> y x) = {}, but (\z x -> z x) y = {y}
+-- In the first case, we can resolve y later (in the recursive environment, for example)
+-- In the second case, we need y immediately to compute the closure.
+-- We can detect bad recursions that way, which Elm cannot (see https://github.com/elm-lang/elm-compiler/issues/1580)
+compulsoryDependencies_: Exp -> List Ident
+compulsoryDependencies_ e = case e.val.e__ of
+  EFun _ _ _ _ -> []
+  EVar _ x -> [x]
+  _ -> childExps e |> List.concatMap compulsoryDependencies_
 
-reorderDefinitions: List LetExp -> (List LetExp, List Int)
+compulsoryDependencies: Exp -> Set Ident
+compulsoryDependencies = compulsoryDependencies_ >> Set.fromList
+
+compute_print_order: List Int -> List Int
+compute_print_order evaluationOrder =
+  (Utils.foldLeft (Array.initialize (List.length evaluationOrder) (\_ -> 0)) (Utils.zipWithIndex evaluationOrder) <|
+                \array (n, i) ->
+                  Array.set n i array
+  ) |> Array.toList
+
+reorderDefinitions: List LetExp -> Result String (List LetExp, List Int)
 reorderDefinitions letExps =
   -- We put types at the top
   -- We put expressions which are not EFuns at the top, keeping their order if it is possible
@@ -1989,15 +2006,19 @@ reorderDefinitions letExps =
     LetTypeAlias _ _ _ _ _  -> True
     LetExp _ _ _ _ _ _ _ -> False) letExpsWithIndex
   in
-  let (expMaybeNotFuns, expFunsForSure) = List.partition (\(def, index) -> case def of
-       LetExp _ _ _ _ _ _ e  -> willSurelyProduceClosure e
-       _ -> True
-     ) expDefsWithIndex
+  let expDefsWithDependencies = List.filterMap (\(def, index) -> case def of
+    LetExp _ _ _ pats _ _ e  ->
+       Just ((def, index), (LangUtils.identifiersListInPat pats, compulsoryDependencies e))
+    _ -> Nothing)
   in
-  let expsReordered = reorderByDependency Tuple.second expMaybeNotFuns in
-  let finalExpsWithIndex = typesWithIndex ++ expsReordered ++ expFunsForSure in
-  let (finalExps, evaluationOrder) = List.unzip finalExpsWithIndex in
-  let
+  let render (_, (patsNames, _)) = (Set.toList patsNames |> String.join ",") in
+  case Utils.orderWithDependencies expDefsWithDependencies Tuple.second render of
+    Err msg -> Err msg
+    Ok expsReordered ->
+      let finalExpsWithIndex = typesWithIndex ++ List.map Tuple.second expsReordered in
+      let (finalExps, evaluationOrder) = List.unzip finalExpsWithIndex in
+      let printOrder = compute_print_order evaluationOrder in
+      (finalExps, printOrder)
 
 genericLetBinding : SpacePolicy -> String -> Parser Exp
 genericLetBinding sp letkeyword =
@@ -2025,7 +2046,7 @@ genericLetBinding sp letkeyword =
                   |= expression { sp | first = spaces }
                 )
              )
-          )))
+          )
 
 --------------------------------------------------------------------------------
 -- Comments
