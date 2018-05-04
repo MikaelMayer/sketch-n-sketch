@@ -5,6 +5,7 @@ import Debug
 import Set exposing (Set)
 import Dict exposing (Dict)
 import Regex
+import Array
 
 infinity = 1/0
 
@@ -1397,3 +1398,15 @@ lastLine s = snocUnapply (String.lines s) |> Maybe.map Tuple.second |> Maybe.wit
 
 indexedMapFrom : Int -> (Int -> a -> b) -> List a -> List b
 indexedMapFrom n f = List.indexedMap (\i -> f (i + n))
+
+--------------------------------------------------------------------------
+-- Given a print order and a list, outputs the list with the correct order
+reorder: List Int -> List a -> List a
+reorder order elements =
+  let elementArray = Array.fromList elements in
+  let aux order revAcc = case order of
+    [] -> List.reverse revAcc
+    (head::tailOrder) -> Array.get head elementArray |> Maybe.map (\x -> x :: revAcc) |> Maybe.withDefault revAcc |>
+       aux tailOrder
+  in
+  aux order []
