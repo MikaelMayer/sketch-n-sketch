@@ -1504,13 +1504,16 @@ orderWithDependencies elements elemToNamesDependencies elemToNameDisplay =
        smallestCycle: List a -> Maybe (List a)
        smallestCycle notResolved =
 
-         let nodes = notResolved |> Set.fromList in
+         let nodes: List a
+             nodes = notResolved in
          -- For each name, it gives a list of possible nodes refering to this name.
-         let nodesByName = notResolved |> List.concatMap (\x -> elemToNamesDependencies x |> Tuple.first |> Set.toList |> List.map (\name -> (name, x))) |>
-           groupBy (\(name, target) -> name) in
+         let nodesByName: Dict String (List a)
+             nodesByName = notResolved |> List.concatMap (\x -> elemToNamesDependencies x |> Tuple.first |> Set.toList |> List.map (\name -> (name, x))) |>
+           groupBy (\(name, target) -> name) |> Dict.map (\k v -> List.map Tuple.second v) in
          -- For each node, it gives a list of nodes it depends on.
-         let edges = notResolved |> List.map (\x -> (x,
-           elemToNamesDependencies x |> Tuple.second |>  Set.toList |>List.filterMap (flip Dict.get nodesByName))) |> Dict.fromList in
+         let  edges: Dict a (List a)
+              edges= notResolved |> List.map (\x -> (x,
+           elemToNamesDependencies x |> Tuple.second |>  Set.toList |> List.filterMap (Basics.flip Dict.get nodesByName) |> List.concatMap identity)) |> Dict.fromList in
          case tarjan nodes edges of
            [] -> Nothing
            head :: _ -> Just head

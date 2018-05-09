@@ -27,7 +27,6 @@ import Parser.LanguageKit as LK
 
 import ParserUtils exposing (..)
 import LangParserUtils exposing (..)
-import LangUtils
 import BinaryOperatorParser exposing (..)
 import Utils
 
@@ -2008,7 +2007,7 @@ reorderDefinitions letExps =
   in
   let expDefsWithDependencies = List.filterMap (\(def, index) -> case def of
     LetExp _ _ _ pats _ _ e  ->
-       Just ((def, index), (LangUtils.identifiersListInPat pats, compulsoryDependencies e))
+       Just ((def, index), (identifiersListInPat pats, compulsoryDependencies e))
     _ -> Nothing)
   in
   let render (_, (patsNames, _)) = (Set.toList patsNames |> String.join ",") in

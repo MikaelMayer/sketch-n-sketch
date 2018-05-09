@@ -365,11 +365,44 @@ eval syntax env bt e =
               errorWithBacktrace syntax (e::bt) <| strPos e1.start ++ " not a function"
         in evalVApp v1 es
 
+  ELet wsLet lk defs printOrder wsIn e2 ->
+    let evalrec: Env           -> Env -> List LetExp -> Result String Env
+        evalrec  envPlusRecEnv    recEnv defs = case defs of
+      [] -> Ok recEnv
+      def :: defTail -> case def of
+        LetExp _ _ p _ _ e2 ->
+          case eval_ syntax envPlusRecEnv bt_ e2 of
+            Err s -> Err s
+            Ok (v1, ws1) ->
+              case cons (p, v1) (Just []) of
+                Just recEnv_ ->
+                  evalrec (recEnv_ ++ envPlusRecEnv) (recEnv_ ++ recEnv) defTail
+                Nothing ->
+                  errorWithBacktrace syntax (e::bt) <| strPos e.start ++ " could not match pattern " ++ (Syntax.patternUnparser syntax >> Utils.squish) p ++ " with " ++ valToString v1
+        LeTType _ _ _ _ _ _ -> evalRec env recEnv defTail
+    in
+    case evalrec env [] defs of
+      Err s -> Err s
+      Ok recEnv -> recEnv |> List.map (\(name, def) -> case def.v_ of
+        VClosure _ l  
+
+    eval(E |- let F in G) =
+      R = evalrec(E, [], F)
+      R’ = add to each closure in R (direct or recursively) 1) R itself, 2) the list of identifiers in R in the recursive names.
+      eval(E ++ R’, G)
+
+    evalrec(E, R, (x = F) :: G)
+      R’ = R ++ [(x, eval(E ++ R |- F))]
+      evalrec(E, R’, G)
+
+    evalrec(E, R, []) = R
+
+
   ELet _ _ False p _ e1 _ e2 _ ->
     case eval_ syntax env bt_ e1 of
       Err s       -> Err s
       Ok (v1,ws1) ->
-        case cons (p, v1) (Just env) of
+        case cons (p, v1) (Just (env) of
           Just env_ ->
             -- Don't add provenance: fine to say value is just from the let body.
             -- (We consider equations to be mobile).

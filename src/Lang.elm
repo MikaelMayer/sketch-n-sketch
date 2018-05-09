@@ -240,8 +240,7 @@ type FunArgStyle = FunArgAsPats | FunArgsAfterEqual
 
 type LetExp =
     LetExp WS (Maybe TypeAnnotation) WS Pat FunArgStyle WS{-before = -} Exp {- usual exp. -}
-  | LetType WS Pat FunArgStyle WS Type {- prefixed with ‘  type’ -}
-  | LetTypeAlias WS WS Pat FunArgStyle WS Type {- prefix with ‘  type   alias’-}
+  | LetType WS (Maybe WS) Pat FunArgStyle WS Type {- prefixed with ‘  type’. If the maybe is Just Ws, then it's an alias) -}
 
 type Exp__
   = EConst WS Num Loc WidgetDecl
@@ -385,8 +384,7 @@ type Trace = TrLoc Loc | TrOp Op_ (List Trace)
 endPosLetExp: LetExp -> Pos
 endPosLetExp def = case def of
   LetExp _ _ _ _ _ _ e1 -> e1.end
-  LetType _ _ _ _ t -> t.end
-  LetTypeAlias _ _ _ _ _ t -> t.end
+  LetType _ _ _ _ _ t -> t.end
 
 allTraceLocs : Trace -> List Loc
 allTraceLocs trace =
@@ -697,8 +695,7 @@ mapFoldExp f initAcc e =
               Tuple.mapFirst (\newDef -> newDef::accDefs) <|
                case def of
                  LetExp spl mbTyp sp0 name funPolicy spEq e1 -> Tuple.mapFirst (\newE1 -> LetExp spl mbTyp sp0 name funPolicy spEq newE1) <| recurse acc e1
-                 LetType spaceBeforeType name funPolicy spEq tp -> (def, acc)
-                 LetTypeAlias spaceBeforeType spaceBeforeAlias name funPolicy spEq tp -> (def, acc)
+                 LetType spType mbSpAlias name funPolicy spEq tp -> (def, acc)
       in
       wrapAndMap (ELet ws1 lettype newDefinitions printOrder spaceBeforeIn newBody) newAcc2
 
@@ -860,8 +857,7 @@ mapFoldExpTopDown f initAcc e =
               Tuple.mapFirst (\newDef -> newDef::accDefs) <|
                case def of
                  LetExp spl mbTyp sp0 name funPolicy spEq e1 -> Tuple.mapFirst (\newE1 -> LetExp spl mbTyp sp0 name funPolicy spEq newE1) <| recurse acc e1
-                 LetType spaceBeforeType name funPolicy spEq tp -> (def, acc)
-                 LetTypeAlias spaceBeforeType spaceBeforeAlias name funPolicy spEq tp -> (def, acc)
+                 LetType spType mbSpAlias name funPolicy spEq tp -> (def, acc)
       in
       let (newBody, newAcc3) = recurse newAcc2 body in
       ret (ELet ws1 lettype (List.reverse newRevDefinitions) printOrder spaceBeforeIn newBody) newAcc3
@@ -1039,8 +1035,7 @@ mapFoldExpTopDownWithScope f handleELet handleEFun handleCaseBranch initGlobalAc
                 Tuple.mapFirst (\newDef -> newDef::accDefs) <|
                  case def of
                    LetExp spl mbTyp sp0 name funPolicy spEq e1-> Tuple.mapFirst (\newE1 -> LetExp spl mbTyp sp0 name funPolicy spEq newE1) <| recurse newGlobalAcc newScopeTempAcc e1
-                   LetType spaceBeforeType name funPolicy spEq tp -> (def, newGlobalAcc)
-                   LetTypeAlias spaceBeforeType spaceBeforeAlias name funPolicy spEq tp -> (def, newGlobalAcc)
+                   LetType spType mbSpAlias name funPolicy spEq tp -> (def, newGlobalAcc)
       in
       let (newBody, newGlobalAcc3) = recurse newGlobalAcc2 newScopeTempAcc body in
       ret (ELet ws1 lettype (List.reverse newRevDefinitions) printOrder spaceBeforeIn newBody) newGlobalAcc3
@@ -1225,8 +1220,7 @@ mapPatNode pid f root =
           ELet  ws1 lettype definitions printOrder spaceBeforeIn body ->
             let newDefinitions = definitions |> List.map (\def -> case def of
                LetExp spl mbTyp sp0 name funPolicy spEq e1 -> LetExp spl mbTyp sp0 (mapPatNodePat pid f name) funPolicy spEq e1
-               LetType spaceBeforeType name funPolicy spEq tp -> def
-               LetTypeAlias spaceBeforeType spaceBeforeAlias name funPolicy spEq tp -> def
+               LetType spType mbSpAlias name funPolicy spEq tp -> def
               )
             in
             ELet ws1 lettype newDefinitions printOrder spaceBeforeIn body
@@ -1455,9 +1449,7 @@ childExpsExtractors e =
            LetExp spl mbTyp sp0 name funStyle spEq e1-> (e1::exps, \subExps -> case rebuilder subExps of
              (definitions, newE1::tail) -> (LetExp spl mbTyp sp0 name funStyle spEq newE1::definitions, tail)
              _ -> Debug.crash <| "[internal error] Unespected empty list for LetExp")
-           LetType spaceBeforeType name funStyle spEq tp ->
-             (exps, \subExps -> Tuple.mapFirst (\defs -> def::defs) (rebuilder subExps))
-           LetTypeAlias spaceBeforeType spaceBeforeAlias name funStyle spEq tp ->
+           LetType spType mbSpAlias name funStyle spEq tp ->
              (exps, \subExps -> Tuple.mapFirst (\defs -> def::defs) (rebuilder subExps))
       in
       (List.reverse (body::revDefExps), multiArgExtractor "ELet-unexp" e <| \newExps ->
@@ -1835,8 +1827,7 @@ mapLetPats f lk = case lk of
   LetExp spt mbTyp sp0 name funStyle spEq e1-> LetExp spt (Maybe.map (\(TypeAnnotation name ws tp) ->
       TypeAnnotation (f name) ws tp) mbTyp
     ) sp0 (f name) funStyle spEq e1
-  LetType spType name funStyle spEq tp -> LetType spType (f name) funStyle spEq tp
-  LetTypeAlias spType spAlias name funStyle spEq tp -> LetTypeAlias spType spAlias (f name) funStyle spEq tp
+  LetType spType mbSpAlias name funStyle spEq tp -> LetType spType mbSpAlias (f name) funStyle spEq tp
 
 clearNodeIds e =
   let eidCleared = clearEId e in
@@ -2265,8 +2256,8 @@ allWhitespaces_ exp =
         LetExp sp1 mbTyp sp0 name funStyle spEq e1                -> [sp1] ++
           (Maybe.map (\(TypeAnnotation p ws t) -> allWhitespacesPat_ p ++ [ws] ++ allWhitespacesType_ t) mbTyp |> Maybe.withDefault []) ++ [sp0] ++
           allWhitespacesPat_ name ++ [spEq] ++ allWhitespaces_ e1
-        LetType spType name funStyle spEq tp              -> [spType] ++ allWhitespacesPat_ name ++ [spEq] ++ allWhitespacesType_ tp
-        LetTypeAlias spType spAlias name funStyle spEq tp -> [spType, spAlias] ++ allWhitespacesPat_ name ++ [spEq] ++ allWhitespacesType_ tp
+        LetType spType mbSpAlias name funStyle spEq tp -> [spType] ++  (mbSpAlias |> Maybe.map (\x -> [x]) |> Maybe.withDefault []) ++
+           allWhitespacesPat_ name ++ [spEq] ++ allWhitespacesType_ tp
        ) ds ++ [ws2] ++ allWhitespaces_ body
     ECase      ws1 e1 bs ws2                -> [ws1] ++ allWhitespaces_ e1 ++ List.concatMap allWhitespacesBranch bs ++ [ws2]
     EComment   ws s e1                      -> [ws] ++ allWhitespaces_ e1
@@ -2956,12 +2947,10 @@ childCodeObjects co =
             [ ET Before ws1 e] ++ (
             defs |> Utils.zipWithIndex |> Utils.reorder printOrder |> List.concatMap (\(def, index) ->
             case def of
-              LetType spType p1 funPolicy spEq tp ->
-                [T tp ]
-              LetTypeAlias spType spAlias p1 funPolicy spEq t1 ->
-                [ P e p1
-                , T t1
-                , TT After (withInfo "" t1.end t1.end) t1
+              LetType spType mbSpAlias p1 funPolicy spEq tp ->
+                [ P e p1,
+                  T tp,
+                  TT After (withInfo "" tp.end tp.end) tp
                 ]
               LetExp spt mbTyp spp p1 ws2 funStyle e1 ->
                 [ET Before spt e] ++
@@ -3331,9 +3320,7 @@ taggedExpPats exp =
         LetExp _ (Just (TypeAnnotation p0 _ _)) _ p1 _ _ _ ->
           tagSinglePat (rootPathedPatternId (exp.val.eid, 1)) p0 ++
           tagSinglePat (rootPathedPatternId (exp.val.eid, 1)) p1
-        LetType _ p1 _ _ _ ->
-          tagSinglePat (rootPathedPatternId (exp.val.eid, 1)) p1
-        LetTypeAlias _ _ p1 _ _ _ ->
+        LetType _ _ p1 _ _ _ ->
           tagSinglePat (rootPathedPatternId (exp.val.eid, 1)) p1
       ) defs
     _ ->
@@ -3388,6 +3375,127 @@ firstNestedExp e =
 --
 --  in
 --    map fixOp
+
+branchPatExps : List Branch -> List (Pat, Exp)
+branchPatExps branches =
+  List.map
+    (.val >> \(Branch_ _ pat exp _) -> (pat, exp))
+    branches
+
+
+identifiersListInPat : Pat -> List Ident
+identifiersListInPat pat =
+  case pat.val.p__ of
+    PVar _ ident _              -> [ident]
+    PList _ pats _ (Just pat) _ -> List.concatMap identifiersListInPat (pat::pats)
+    PList _ pats _ Nothing    _ -> List.concatMap identifiersListInPat pats
+    PAs _ ident _ pat           -> ident::(identifiersListInPat pat)
+    _                           -> []
+
+
+identifiersListInPats : List Pat -> List Ident
+identifiersListInPats pats =
+  List.concatMap
+    identifiersListInPat
+    pats
+
+
+-- All identifiers used or bound throughout the given exp
+identifiersList : Exp -> List Ident
+identifiersList exp =
+  let folder e__ acc =
+    case e__ of
+       EVar _ ident ->
+         ident::acc
+
+       EFun _ pats _ _ ->
+         (List.concatMap identifiersListInPat pats) ++ acc
+
+       ECase _ _ branches _ ->
+         let pats = branchPats branches in
+         (List.concatMap identifiersListInPat pats) ++ acc
+
+       ELet _ _ defs _ _ _ ->
+           (defs |> List.concatMap (\def -> case def of
+             LetExp _ _ _ pat _ _ _ ->
+               (identifiersListInPat pat) ++ acc
+             LetType _ _ pat _ _ _ ->
+               (identifiersListInPat pat) ++ acc
+              )) ++ acc
+
+       _ ->
+         acc
+  in
+  foldExpViaE__
+    folder
+    []
+    exp
+
+
+
+identifiersSet : Exp -> Set.Set Ident
+identifiersSet exp =
+  identifiersList exp
+  |> Set.fromList
+
+
+identifiersSetInPat : Pat -> Set.Set Ident
+identifiersSetInPat pat =
+  identifiersListInPat pat
+  |> Set.fromList
+
+
+identifiersSetInPats : List Pat -> Set.Set Ident
+identifiersSetInPats pats =
+  List.map identifiersSetInPat pats
+  |> Utils.unionAll
+
+
+expToMaybeIdent : Exp -> Maybe Ident
+expToMaybeIdent exp =
+  case exp.val.e__ of
+    EVar _ ident -> Just ident
+    _            -> Nothing
+
+freeVars : Exp -> List Exp
+freeVars exp =
+  let removeIntroducedBy pats vars =
+    let introduced = identifiersListInPats pats in
+    vars |> List.filter (\var -> not <| List.member (Utils.fromJust_ "freeVars" <| expToMaybeIdent var) introduced)
+  in
+  case exp.val.e__ of
+    EVar _ x                           -> [exp]
+    EFun _ pats body _                 -> freeVars body |> removeIntroducedBy pats
+    ECase _ scrutinee branches _       ->
+      let freeInEachBranch =
+        branchPatExps branches
+        |> List.concatMap (\(bPat, bExp) -> freeVars bExp |> removeIntroducedBy [bPat])
+      in
+      freeVars scrutinee ++ freeInEachBranch
+    ELet _ _ defs _ _ body ->
+      (Utils.foldLeft
+        (freeVars body) (List.reverse defs) <|
+        \fvBody def -> case def of
+           LetExp _ _ _ pat _ _ boundExp ->
+             freeVars
+             (identifiersListInPat pat) ++ acc
+           LetType _ _ pat _ _ _ -> fvBody)
+
+    ELet _ _ False pat _ boundExp _ body _ -> freeVars boundExp ++ (freeVars body |> removeIntroducedBy [pat])
+    ELet _ _ True  pat _ boundExp _ body _ -> freeVars boundExp ++ freeVars body |> removeIntroducedBy [pat]
+    _                                  -> childExps exp |> List.concatMap freeVars
+
+
+-- Which var idents in this exp refer to something outside this exp?
+-- This is wrong for TypeCases; TypeCase scrutinee patterns not included. TypeCase scrutinee needs to turn into an expression (done on Brainstorm branch, I believe).
+freeIdentifiers : Exp -> Set.Set Ident
+freeIdentifiers exp =
+  --ImpureGoodies.getOrUpdateCache exp "freeIdentifiers" <| \() -> -- This is not working for now.
+  freeVars exp
+  |> List.map expToMaybeIdent
+  |> Utils.projJusts
+  |> Utils.fromJust_ "LangTools.freeIdentifiers"
+  |> Set.fromList
 
 getTopLevelOptions: Exp -> List (String, String)
 getTopLevelOptions e =
