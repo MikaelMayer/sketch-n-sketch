@@ -123,13 +123,13 @@ pruneEnvPattern pats env =
     [] -> env
     pat::tail ->
         let varspattern = identifiersSetInPat pat in
-        List.filter (\(x, _) -> not <| Set.member x varspattern) env
+        envFun.filter (\x-> not <| Set.member x varspattern) env
         |> pruneEnvPattern tail
 
 pruneEnv: Exp -> Env -> Env
 pruneEnv exp env = -- Remove all the initial environment that is on the right.
   let freeVars = freeIdentifiers exp in
-  List.filter (\(x, _) -> Set.member x freeVars) env
+  envFun.filter (\x -> Set.member x freeVars) env
 
 -- NOTE: This function is mostly copied in Eval, as a temporary, hacky
 -- workaround to dependency issues.
@@ -149,7 +149,7 @@ dictKeyToVal syntax (key, _) =
     )
 
 valFromExpVal_: Exp -> Val_ -> Val
-valFromExpVal_ e v_ = { v_ = v_, provenance = Provenance [] e [], parents = Parents []}
+valFromExpVal_ e v_ = { v_ = v_, provenance = Provenance envFun.empty e [], parents = Parents []}
 
 -- Transforms an expression that does not need evaluation to a value
 simpleExpToVal: Syntax -> Exp -> Result String Val
@@ -233,7 +233,7 @@ valToExpFull copyFrom sp_ indent v =
             EList precedingWS (headExp :: tailExps) space0 Nothing spBeforeEnd
     VClosure mRec patterns body env ->
       let prunedEnv = pruneEnvPattern patterns (pruneEnv body env) in
-      case prunedEnv of
+      case envFun.toLinear <| envFun.removeShadowed <| prunedEnv of
         [] -> EFun sp patterns body space0
         (name, v)::tail ->
           let baseCase =  withDummyExpInfo <| EFun (ws <| foldIndent "" indent) patterns body space0 in
@@ -297,9 +297,11 @@ logEnv msg exp env = let _ = Debug.log (msg ++ ":" ++ envToString (pruneEnv exp 
 
 envToString: Env -> String
 envToString env =
-  case env of
-    [] -> ""
-    (v, value)::tail -> v ++ "->" ++ (valToString value) ++ " " ++ (envToString tail)
+  let aux lenv =
+    case lenv of
+       [] -> ""
+       (v, value)::tail -> v ++ "->" ++ (valToString value) ++ " " ++ aux tail
+  in aux <| envFun.toLinear env
 
 -- Equality checking
 valEqual: Val -> Val -> Bool
@@ -314,7 +316,9 @@ valEqual v1 v2 = --let _ = Debug.log "valEqual of " (valToString v1, valToString
   _ -> False--}
 
 envEqual: Env -> Env -> Bool
-envEqual env1 env2 = --let _ = Debug.log "envEqual " () in
+envEqual env1_ env2_ = --let _ = Debug.log "envEqual " () in
+  let env1 = envFun.toLinear env1_ in
+  let env2 = envFun.toLinear env2_ in
   listForAll2 (\(x1, v1) (x2, v2) -> x1 == x2 && valEqual v1 v2) env1 env2
 
 wsEqual: WS -> WS -> Bool

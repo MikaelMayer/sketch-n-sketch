@@ -224,20 +224,20 @@ replaceDollarOrSlash= builtinVal "UpdateRegex.replaceDollarOrSlash" <| VFun "rep
 unescapeSlashDollar: (Env -> Exp -> Result String (Val, Widgets)) ->
                      (UpdateStack -> Results String (UpdatedEnv, UpdatedExp)) -> Val
 unescapeSlashDollar eval update =
-  let localEnv args = [("replace", replaceAllByIn eval update), ("replacement", replaceDollarOrSlash)] ++ List.map (\arg -> ("string", arg)) args in
+  let localEnv args = envFun.fromLinear <| [("replace", replaceAllByIn eval update), ("replacement", replaceDollarOrSlash)] ++ List.map (\arg -> ("string", arg)) args in
   let localExp = (eApp (eVar "replace") [eStr "\\\\\\$|\\\\\\\\", eVar "replacement", eVar "string"]) in
   builtinVal "UpdateRegex.unescapeSlashDollar" <| VFun "unescapeSlashDollar" ["s"] (\args ->
     eval (localEnv args) localExp
   ) <| Just <| \args oldVal newVal diffs ->
     let prevEnv = localEnv args in
     update (updateContext "unescapeSlashDollar" prevEnv localExp [] oldVal newVal diffs) |> Results.andThen (\(newEnv, newExp) ->
-      case newEnv.val of
-        _::_::(_, newArg)::_ ->
-          case newEnv.changes of
-            (2, argChanges)::_ ->
+      case Dict.get "string" (Tuple.first newEnv.val) of
+        Just (newArg::_) ->
+          case newEnv.changes |> Maybe.andThen (Dict.get "string") of
+            Just ((0, argChanges)::_) ->
                  ok1 ([newArg], [(0, argChanges)])
             _ -> ok1 ([newArg], [])
-        l -> Errs <| "The environment should have contained at least 3 variables, got " ++ toString (List.length newEnv.val)
+        _ -> Errs <| "The environment should have contained the variable 'string', got " ++ toString (newEnv.val)
     )
 
 -- Performs replacements on a string with differences but also return those differences along with the old ones.
@@ -321,7 +321,7 @@ stringToLambda eval update nth join toVal s =
        ) lWithPrevStart
   in
   let lambdaBody = concat "join" (tmp ++ [eApp (eVar "unescapeSlashDollar") [eStr <| String.dropLeft finalLastStart s]]) in
-  (toVal<| VClosure Nothing [pVar "m"] lambdaBody [
+  (toVal<| VClosure Nothing [pVar "m"] lambdaBody <| envFun.fromLinear [
     ("nth", nth), ("join", join), ("unescapeSlashDollar", unescapeSlashDollar eval update)], oldConcatenationStarts)
 
 type EvaluationError = EvaluationError String
@@ -516,11 +516,12 @@ replaceByIn howmany {-stringjoin-} name evaluate update = builtinVal "UpdateRege
         _ -> Errs <| "regex replacement expects three arguments, got " ++ toString (List.length args)
   ))
 
+evalReplacement: (Env -> Exp -> Result String (Val, Widgets)) -> Val -> GroupStartMap.Match -> Result String Val
 evalReplacement eval closureReplacementV gsmMatch =
   let replacementName = "user_callback" in
   let argumentName = "x" in
   let matchVal = matchToVal (gsmMatchToRegexMatch gsmMatch) in
-  let localEnv = [(replacementName, closureReplacementV), (argumentName, matchVal)] in
+  let localEnv = envFun.fromLinear [(replacementName, closureReplacementV), (argumentName, matchVal)] in
   let localExp = matchApp replacementName argumentName in
   --let _ = Debug.log ("The new env is" ++ LangUtils.envToString localEnv) () in
   --let _ = Debug.log ("The replacement body is" ++ Syntax.unparser Syntax.Elm localExp) () in
@@ -637,36 +638,39 @@ updateRegexReplaceByIn howmany eval update regexpV replacementV stringV oldOutV 
             -- let _ = Debug.log "regex4" () in
             let argumentsMatches = Utils.zipWithIndex matches |> List.map (\(m, i) -> (argName i, gsmMatchToRegexMatch m)) in
             let argumentsEnv = argumentsMatches |> List.map (\(name, m) -> (name, matchToVal m)) in
+            let argumentsNames = List.unzip argumentsEnv |> Tuple.first in
             let argNameToIndex = argumentsMatches |> List.indexedMap (\i (name, _) -> (name, i)) |> Dict.fromList in
             let argumentsMatchesDict = Dict.fromList argumentsMatches in
-            let envWithReplacement= (replacementName, replacementV)::("join", join)::argumentsEnv in
+            let envWithReplacement= envFun.fromLinear <| (replacementName, replacementV)::("join", join)::argumentsEnv in
             update (updateContext "regex replace" envWithReplacement expressionReplacement [] oldVal newOutV diffs) |> Results.andThen (
                \(newEnvWithReplacement, newUpdatedExp) ->
                  --let _ = Debug.log "newEnvWithReplacement.changes " newEnvWithReplacement.changes in
-              case newEnvWithReplacement.val of
-                (_, newReplacementV)::_::newArguments ->
-                  let newRemplacementVChanges = case newEnvWithReplacement.changes of
-                    (0, c) :: tail -> [(1, c)]
+              let (d, ids) = newEnvWithReplacement.val in
+              let newArgumentsDicts = d in
+              case (Dict.get replacementName d) of
+                Just (newReplacementV::_) ->
+                  let newRemplacementVChanges = case newEnvWithReplacement.changes |> Maybe.andThen (Dict.get replacementName) of
+                    Just ((0, c) :: _) -> [(1, c)]
                     _ -> []
                   in
-                  let argChangeByIndex = UpdateUtils.dropDiffs 2 newEnvWithReplacement.changes |> Dict.fromList in
                   let getArgChange: String -> Maybe VDiffs
                       getArgChange name =
-                    Dict.get name argNameToIndex |> Maybe.andThen (flip Dict.get argChangeByIndex)
+                        case newEnvWithReplacement.changes |> Maybe.andThen (Dict.get name) of
+                          Just ((0, change)::_) -> Just change
+                          _ -> Nothing
                   in
                   -- TODO: When unconaatenating, compute the newStringVChanges
                   -- let _ = Debug.log "regex6" () in
                   flip Results.andThen (Results.fromResult <| unconcat newUpdatedExp.val newUpdatedExp.changes) <| \(newConcatenation, listElemDiffs) ->
-                  let newArgumentsDicts = Dict.fromList newArguments in
                   let recoverSubExpressionStringDiffs e =
                     case appMatchArg e of
                      Err s -> Errs s
                      Ok argname -> case Dict.get argname argumentsMatchesDict of
                        Nothing -> Errs <| "Could not find " ++ argname ++ " in " ++ toString argumentsMatchesDict
                        Just oldMatch -> case Dict.get argname newArgumentsDicts of
-                         Nothing -> Errs <| "Could not find " ++ argname ++ " in new environment"
-                         Just newVal ->
+                         Just (newVal::_) ->
                            recoverMatchedStringDiffs oldMatch newVal (getArgChange argname)
+                         _ -> Errs <| "Could not find " ++ argname ++ " in new environment"
                   in
                   let recoverSubStringsDiffs e =
                      case eStrUnapply e of
@@ -689,7 +693,7 @@ updateRegexReplaceByIn howmany eval update regexpV replacementV stringV oldOutV 
                       let newChanges = newRemplacementVChanges ++ newStringVChanges in
                       ok1 ([regexpV, newReplacementV, Vb.string (Vb.fromVal stringV) newString], newChanges)
                     )
-                _ -> Debug.crash "A variable disappeared from the environment"
+                _ -> Debug.crash <| "Variable " ++ replacementName ++ " disappeared from a built-in environment"
               )
      _ -> Errs <| "replaceAllIn expects a regex (String), a replacement (string/lambda), and the text. Got instead  " ++ valToString regexpV ++ ", " ++ valToString replacementV ++ ", " ++ valToString stringV ++ " updated by " ++ valToString newOutV
            -- Commented out because dependency cycle

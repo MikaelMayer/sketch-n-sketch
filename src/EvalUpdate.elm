@@ -27,7 +27,7 @@ import ValBuilder as Vb
 import ValUnbuilder as Vu
 import UpdateRegex
 
-builtinEnv =
+builtinEnv = envFun.fromLinear <|
   [ ("error", builtinVal "EvalUpdate.error" <| VFun "error" ["msg"] (oneArg "error" <| \arg ->
       case arg.v_ of
         VBase (VString s) -> Err s
@@ -88,19 +88,20 @@ builtinEnv =
   , (">>", builtinVal "EvalUpdate.>>" <| VFun ">>" ["left", "right", "x"] (\args ->
       case args of
         [left, right, x] ->
-           let env = [("x", x), ("left", left), ("right", right)] in
+           let env = envFun.fromLinear [("x", x), ("left", left), ("right", right)] in
            Eval.doEval Syntax.Elm env (eApp (eVar "right") [eApp (eVar "left") [eVar "x"]]) |> Result.map Tuple.first
         _ -> Err <| ">> expects 3 arguments, got " ++ toString (List.length args)
       ) (Just (\args oldVal newVal d -> case args of
       [left, right, x] ->
-        let env = [("left", left), ("right", right), ("x", x)] in
+        let env = envFun.fromLinear [("left", left), ("right", right), ("x", x)] in
         updateContext ">>" env (eApp (eVar "right") [eApp (eVar "left") [eVar "x"]]) [] oldVal newVal d |>
         update |>
           Results.filter (\(newEnv, newExp) -> newExp.changes == Nothing) |>
           Results.map (\(newEnv, _) ->
-            case newEnv.val of
-              [(_, newLeft), (_, newRight), (_, newX)] ->
-                ([newLeft, newRight, newX], newEnv.changes)
+             let (d, ids) = newEnv.val in
+             case (Dict.get "left" d, Dict.get "right" d, Dict.get "x" d) of
+              (Just (newLeft::_), Just (newRight::_), Just (newX::_)) ->
+                 ([newLeft, newRight, newX], Maybe.map (envFun.diffToLinear newEnv.val) newEnv.changes |> Maybe.withDefault [])
               _ -> Debug.crash "[internal error] >> Environment is empty !!!"
             )
       _ -> Errs <| ">> expects 3 arguments, got " ++ toString (List.length args)
@@ -108,18 +109,20 @@ builtinEnv =
   , ("<<", builtinVal "EvalUpdate.<<" <| VFun "<<" ["left", "right", "x"] (\args ->
     case args of
       [left, right, x] ->
-         let env = [("x", x), ("left", left), ("right", right)] in
+         let env = envFun.fromLinear  [("x", x), ("left", left), ("right", right)] in
          Eval.doEval Syntax.Elm env (eApp (eVar "left") [eApp (eVar "right") [eVar "x"]]) |> Result.map Tuple.first
       _ -> Err <| ">> expects 2 arguments, got " ++ toString (List.length args)
     ) (Just (\args oldVal newVal d -> case args of
     [left, right, x] ->
-      let env = [("left", left), ("right", right), ("x", x)] in
+      let env = envFun.fromLinear [("left", left), ("right", right), ("x", x)] in
       updateContext ">>" env (eApp (eVar "left") [eApp (eVar "right") [eVar "x"]]) [] oldVal newVal d |>
       update |>
         Results.filter (\(newEnv, newExp) -> newExp.changes == Nothing) |>
         Results.map (\(newEnv, _) ->
-          case newEnv.val of
-            [(_, newLeft), (_, newRight), (_, newX)] -> ([newLeft, newRight, newX], newEnv.changes)
+          let (d, ids) = newEnv.val in
+          case (Dict.get "left" d, Dict.get "right" d, Dict.get "x" d) of
+            (Just (newLeft::_), Just (newRight::_), Just (newX::_)) ->
+               ([newLeft, newRight, newX], Maybe.map (envFun.diffToLinear newEnv.val) newEnv.changes |> Maybe.withDefault [])
             _ -> Debug.crash "[internal error] << Environment is empty !!!"
           )
     _ -> Errs <| "<< expects 3 arguments, got " ++ toString (List.length args)
@@ -168,7 +171,7 @@ builtinEnv =
           VRecord d ->
             case (Dict.get "fun" d, Dict.get "input" d, Dict.get "output" d) of
               (Just fun, Just input, Just newVal) ->
-                let xyEnv = [("x", fun),("y", input)] in
+                let xyEnv = envFun.fromLinear [("x", fun),("y", input)] in
                 let xyExp = (withDummyExpInfo <| EApp space0 (eVar "x") [eVar "y"] SpaceApp space0) in
                 let oldOut = case Dict.get "oldOutput" d of
                   Nothing -> case Dict.get "oldout" d of
@@ -208,9 +211,8 @@ builtinEnv =
                           Oks ll ->
                              let l = LazyList.toList ll in
                              let lFiltered = List.filter (\(newXYEnv, newExp) ->
-                               case newXYEnv.changes of
-                                  [] -> True
-                                  [(1, _)] -> True
+                               case newXYEnv.changes |> Maybe.andThen (Dict.get "x") of -- We don't want changes to x
+                                  Nothing -> True
                                   _ -> False) l
                              in
                              if List.isEmpty lFiltered then
@@ -220,18 +222,19 @@ builtinEnv =
                                  Vb.record Vb.string vb (Dict.fromList [("error", "Only solutions modifying the constant function of __updateApp__")])
                              else
                                let (results, diffs) = lFiltered |> List.map (\(newXYEnv, newExp) ->
-                                 case newXYEnv.val of
-                                    [("x", newFun), ("y",newArg)] ->
-                                      case newXYEnv.changes of
-                                        [] -> (newArg, Nothing)
-                                        [(1, diff)] -> (newArg, Just diff)
-                                        _ -> Debug.crash "Internal error: expected not much than (1, diff) in environment changes"
+                                 let (d, ids) = newXYEnv.val in
+                                 case (Dict.get "x" d, Dict.get "y" d) of
+                                    (Just (newFun::_), Just (newArg::_)) ->
+                                      case newXYEnv.changes |> Maybe.andThen (Dict.get "y") of
+                                        Just [(0, diff)] -> (newArg, Just diff)
+                                        Nothing -> (newArg, Nothing)
+                                        _ -> Debug.crash "Internal error: expected not much than (0, diff) in environment changes"
                                     _ -> Debug.crash "Internal error: expected x and y in environment"
                                  ) |> List.unzip in
                                let maybeDiffsVal = diffs |> Vb.list (Vb.maybe vDiffsToVal) vb in
                                Vb.record Vb.identity vb (
                                     Dict.fromList [("values", Vb.list Vb.identity vb results),
-                                                 ("diffs", maybeDiffsVal )
+                                                   ("diffs", maybeDiffsVal )
                                     ])
                         in Ok (basicResult, [])
               (mbFun, mbInput, mbOutput) ->
@@ -502,7 +505,7 @@ parseAndRun = valToString << Tuple.first << Utils.fromOk_ << run Syntax.Little <
 
 parseAndRun_ = strVal_ True << Tuple.first << Utils.fromOk_ << run Syntax.Little << Utils.fromOkay "parseAndRun_" << Parser.parse
 
-preludeIdentifiers = preludeEnv |> List.map Tuple.first |> Set.fromList
+preludeIdentifiers = preludeEnv |> Tuple.second |> Set.fromList
 
 identifiersSetPlusPrelude : Exp -> Set.Set Ident
 identifiersSetPlusPrelude exp =

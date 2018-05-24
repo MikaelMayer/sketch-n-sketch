@@ -22,6 +22,8 @@ build/out/keyBlocker.js
 build/out/outputCanvas.js
 build/out/solverServer.js
 build/out/img/*
+build/idea/
+out/
 *swp
 src/*swp
 src/*swo

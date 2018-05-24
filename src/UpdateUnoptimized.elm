@@ -9,10 +9,15 @@ import Info exposing (..)
 
 -- For benchmarking only
 mergeEnvGeneral: Exp -> Set Ident -> Env -> Env -> Env -> Env
-mergeEnvGeneral origExp fv originalEnv newEnv1 newEnv2 =
+mergeEnvGeneral origExp fv originalEnv_ newEnv1_ newEnv2_ =
+  let originalEnv = envFun.toLinear originalEnv_
+      newEnv1 = envFun.toLinear newEnv1_
+      newEnv2 = envFun.toLinear newEnv2_
+  in
+  envFun.fromLinear <|
   --let _ = Debug.log ("TriCombine starts on " ++ Syntax.unparser Syntax.Elm origExp) (envToString originalEnv, envToString newEnv1, envToString newEnv2) in
-  let aux: Env -> Set Ident -> Env ->      Env ->  Env ->  Env
-      aux  revAcc fv           originalEnv newEnv1 newEnv2 =
+  let aux: LinearEnv -> Set Ident -> LinearEnv -> LinearEnv ->  LinearEnv ->  LinearEnv
+      aux  revAcc       fv           originalEnv  newEnv1       newEnv2 =
        --let _ = Debug.log "aux " (envToString acc, envToString originalEnv, envToString newEnv1, envToString newEnv2) in
        case (originalEnv, newEnv1, newEnv2) of
          ([], [], []) -> List.reverse revAcc

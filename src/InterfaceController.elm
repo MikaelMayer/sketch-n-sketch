@@ -2204,7 +2204,7 @@ doCallUpdate m =
       let _ = Debug.log "Filtering solutions" () in
       let solutionsNotModifyingEnv =
          LazyList.filter
-           (\(env, exp) -> List.isEmpty env.changes)
+           (\(env, exp) -> Utils.maybeIsEmpty env.changes)
            solutions
       in
       let _ = Debug.log "Filtered solutions" () in
@@ -2216,9 +2216,9 @@ doCallUpdate m =
 
             LazyList.Cons (envModified, expModified) _ ->
               let _ = Debug.log (UpdateUtils.diffExp m.inputExp expModified.val) "expModified" in
-              let _ = Debug.log (EvalUpdate.preludeEnv |> List.take 5 |> List.map Tuple.first |> String.join " ") ("EnvNames original") in
-              let _ = Debug.log (envModified.val |> List.take 5 |> List.map Tuple.first |> String.join " ") ("EnvNames modified") in
-              let _ = Debug.log (UpdateUtils.envDiffsToString EvalUpdate.preludeEnv envModified.val envModified.changes) ("EnvModified") in
+              let _ = Debug.log (EvalUpdate.preludeEnv |> envFun.extractLinear 5 |> Tuple.first |> List.map Tuple.first |> String.join " ") ("EnvNames original") in
+              let _ = Debug.log (envModified.val |> envFun.extractLinear 5 |> Tuple.first |> List.map Tuple.first |> String.join " ") ("EnvNames modified") in
+              let _ = Debug.log (UpdateUtils.envDiffsToString EvalUpdate.preludeEnv envModified.val (envModified.changes |> Maybe.withDefault Dict.empty)) ("EnvModified") in
               --let _ = Debug.log (UpdateUtils.diff (\(k, v) -> LangUtils.valToString v) (LangUtils.pruneEnv expModified envModified.val) (LangUtils.pruneEnv expModified EvalUpdate.preludeEnv)
               --     |> UpdateUtils.displayDiff (\(k, v) -> "\n" ++ k ++ " = " ++ LangUtils.valToString v )
               --     ) "envModified"

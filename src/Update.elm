@@ -49,14 +49,13 @@ unparse = Syntax.unparser Syntax.Elm
 unparsePattern = Syntax.patternUnparser Syntax.Elm
 
 updateEnv: Env -> Ident -> Val -> VDiffs -> UpdatedEnv
-updateEnv env k newValue modif =
-  let aux: Int -> Env -> Env -> UpdatedEnv
-      aux i acc env =
-     case env of
-       [] -> Debug.crash <| k ++ " not found in environment "
-       ((kk, vv) as kv)::tail ->
-         if kk == k then UpdatedEnv (List.reverse acc ++ ((kk, newValue)::tail)) [(i, modif)] else aux (i + 1) (kv::acc) tail
-  in aux 0 [] env
+updateEnv (d, ids) k newValue modif =
+  let newEnv = Dict.update k (\mbv -> case mbv of
+     Just (v :: tail) -> Just (newValue ::tail)
+     _ -> Nothing) d
+  in
+  let newEnvModif = Just <| Dict.fromList [(k, [(0, modif)])] in
+  UpdatedEnv (newEnv, ids) newEnvModif
 
 -- Make sure that Env |- Exp evaluates to oldVal
 -- NextAction is a list of HandlePreviousREsult followed by a list of Fork in the same list.
@@ -157,7 +156,7 @@ getUpdateStackOp env e prevLets oldVal newVal diffs =
                in
                updateResult (UpdatedEnv newEnv envModifs) updatedE
              VUnoptimizedDiffs ->
-               updateResult (UpdatedEnv newEnv [(0, VUnoptimizedDiffs)]) (UpdatedExp e (Just (EConstDiffs EAnyDiffs)))
+               updateResult (UpdatedEnv newEnv (Just <| Dict.fromList [("unoptimized", [(0, VUnoptimizedDiffs)])])) (UpdatedExp e (Just (EConstDiffs EAnyDiffs)))
              k -> UpdateCriticalError <| "[internal error] Unexpected modifications to a function: " ++ toString k
          _ -> UpdateCriticalError <| "[internal error] Trying to update a function with non-closure " ++ valToString newVal
 
@@ -574,7 +573,7 @@ getUpdateStackOp env e prevLets oldVal newVal diffs =
                                            ("diffOut", diffsVal) -- Redundant
                                          ] in
                                     let xyApplication = replaceE__ e <| EApp space0 x [y] SpaceApp space0 in
-                                    let xyEnv = [("x", fieldUpdateClosure), ("y", customArgument)] in
+                                    let xyEnv = envFun.fromLinear [("x", fieldUpdateClosure), ("y", customArgument)] in
                                     case (
                                         --ImpureGoodies.logTimedRun (".update eval line " ++ toString e1.start.line) <| \_ ->
                                         doEval Syntax.Elm xyEnv xyApplication) of
@@ -637,7 +636,7 @@ getUpdateStackOp env e prevLets oldVal newVal diffs =
                                      let y = eVar "y" in
                                      let customArgument = newVal in
                                      let customExpr = replaceE__ e <| EApp space0 x [y] SpaceApp space0 in
-                                     case doEval Syntax.Elm (("x", fieldUnapplyClosure)::("y", customArgument)::env) customExpr of
+                                     case doEval Syntax.Elm (envFun.fromLinear <| ("x", fieldUnapplyClosure)::("y", customArgument)::[]) customExpr of
                                        Err s -> Just <| UpdateCriticalError <| "while evaluating the .unapply of a lens, " ++ s
                                        Ok ((vResult, _), _) -> -- Convert vResult to a list of results.
                                          case interpreterMaybeToMaybe "the result of executing 'unapply'" vResult of
@@ -669,22 +668,22 @@ getUpdateStackOp env e prevLets oldVal newVal diffs =
                    (_, Err s) -> UpdateCriticalError s
                    (Ok ((v1, _), _), Ok ((v2, _), ws2)) ->
                       let rewrite2 exp2Builder =
-                            updateContinue "Rewriting ++ to +" (("x", v1)::("y", v2)::env)
+                            updateContinue "Rewriting ++ to +" (envFun.fromLinear [("x", v1), ("y", v2)])
                               (exp2Builder (replaceE__ eLeft <| EVar space0 "x") (replaceE__ eRight <| EVar space0 "y")) [] oldVal newVal diffs <|
                             \newAugEnv newUpdatedE1 -> -- we discard changes to E1
-                              case newAugEnv.val of
-                                ("x", newV1)::("y", newV2)::newEnv ->
+                              let (d, ids) = newAugEnv.val in
+                              case (Dict.get "x" d, Dict.get "y" d) of
+                                (Just (newV1::_), Just (newV2::_)) ->
                                   let eLeft_continue =
-                                    case diffsAt 0 newAugEnv.changes of
+                                    case newAugEnv.changes |> Maybe.andThen (Dict.get "x") |> Maybe.andThen (diffsAt 0) of
                                       Nothing -> \continuation -> continuation (UpdatedEnv.original env) (UpdatedExp eLeft Nothing)
                                       Just d -> updateContinue "left of ++" env eLeft [] v1 newV1 d
                                   in
                                   let eRight_continue =
-                                    case diffsAt 1 newAugEnv.changes of
+                                    case newAugEnv.changes |> Maybe.andThen (Dict.get "y") |> Maybe.andThen (diffsAt 0) of
                                       Nothing -> \continuation -> continuation (UpdatedEnv.original env) (UpdatedExp eRight Nothing)
                                       Just d -> updateContinue "right of ++" env eRight [] v2 newV2 d
                                   in
-                                  let finalEnv = dropDiffs 2 newAugEnv.changes in
                                   eLeft_continue <| \newELeftEnv newELeft ->
                                     eRight_continue <| \newERightEnv newERight ->
                                       let (newE, newEChanges) = case (newELeft.changes, newERight.changes) of
@@ -767,7 +766,7 @@ getUpdateStackOp env e prevLets oldVal newVal diffs =
                                     --let _ = Debug.log ("newV2sDiffs : " ++ (List.map toString newV2sDiffs |> String.join "")) () in
                                     let (newV1, newV1Diffs) =
                                       case (newUpdatedEnv_.changes, modifBody) of
-                                        ([], Nothing) -> (v1, Nothing)
+                                        (Nothing, Nothing) -> (v1, Nothing)
                                         _ ->
                                           (replaceV_ v1 <| VClosure recName (e1psUsed ++ psOut) outBody newUpdatedEnv_.val, Just <| VClosureDiffs newUpdatedEnv_.changes modifBody)
                                     in
@@ -792,8 +791,8 @@ getUpdateStackOp env e prevLets oldVal newVal diffs =
                                     --let _ = Debug.log ("newV2s : " ++ (List.map valToString newV2s |> String.join "")) () in
                                     --let _ = Debug.log ("newV2sDiffs : " ++ (List.map toString newV2sDiffs |> String.join "")) () in
                                     let (newV1, newV1Diffs)  = case (newUpdatedEnv_.changes, modifBody, newArgFunDiffs) of
-                                      ([], Nothing, Nothing) -> (v1, Nothing)
-                                      ([], Nothing, _) -> (newArgFun, newArgFunDiffs)
+                                      (Nothing, Nothing, Nothing) -> (v1, Nothing)
+                                      (Nothing, Nothing, _) -> (newArgFun, newArgFunDiffs)
                                       (envChanges, _, Nothing) -> newClosureAndDiffs envChanges |> (\(a, b) -> (a, Just b))
                                       (envChanges, _, Just realArgFunDiffs) ->
                                         let (closure, closuremodifs) = newClosureAndDiffs envChanges in
@@ -809,7 +808,7 @@ getUpdateStackOp env e prevLets oldVal newVal diffs =
                      let continuation newClosure newClosureDiffs newArgs newArgsDiffs msg = --Update the function and the arguments.
                        let e1_updater = case newClosureDiffs of
                          Nothing -> \continuation -> continuation (UpdatedEnv.original env) (UpdatedExp e1 Nothing)
-                         Just (VClosureDiffs [] Nothing) -> \continuation -> continuation (UpdatedEnv.original env) (UpdatedExp e1 Nothing)
+                         Just (VClosureDiffs Nothing Nothing) -> \continuation -> continuation (UpdatedEnv.original env) (UpdatedExp e1 Nothing)
                          Just closureDiffs -> updateContinue msg env e1 (keepLets env v1Env) v1 newClosure closureDiffs
                        in
                        let e2s_updater = case newArgsDiffs of
@@ -1192,7 +1191,7 @@ getUpdateStackOp env e prevLets oldVal newVal diffs =
                             case Syntax.parser Syntax.Elm s of
                               Err msg -> UpdateFails <| "Could not parse new output value '"++s++"' for ToStrExceptStr expression " ++ ParserUtils.showError msg ++ "\nOriginal value was " ++ valToString original
                               Ok parsed ->
-                                case doEval Syntax.Elm [] parsed of
+                                case doEval Syntax.Elm (envFun.empty) parsed of
                                   Err msg -> UpdateFails msg
                                   Ok ((v, _), _) ->
                                     case (opArgs, vs) of
@@ -1222,7 +1221,7 @@ getUpdateStackOp env e prevLets oldVal newVal diffs =
                        case Syntax.parser Syntax.Elm s of
                          Err msg -> UpdateFails <| "Could not parse new output value '"++s++"' for ToStr expression. " ++ (ParserUtils.showError msg)
                          Ok parsed ->
-                           case doEval Syntax.Elm [] parsed of
+                           case doEval Syntax.Elm envFun.empty parsed of
                              Err msg -> UpdateFails msg
                              Ok ((v, _), _) ->
                                case (opArgs, vs) of
@@ -1640,9 +1639,9 @@ branchWithInversion env input branches =
 consWithInversion : (Pat, Val) -> Maybe (Env, UpdatedEnv -> a) -> Maybe (Env, UpdatedEnv -> ((Val, Maybe VDiffs), a))
 consWithInversion pv menv =
   case (matchWithInversion pv, menv) of
-    (Just (env_, envToVal), Just (env, envToA)) -> Just (env_ ++ env,
+    (Just (env_, envToVal), Just (env, envToA)) -> Just (envFun.append env_ env,
       \newUpdatedEnv ->
-        let (newUpdatedEnv_, newUpdatedEnvTail) = UpdatedEnv.split (List.length env_) newUpdatedEnv in
+        let (newUpdatedEnv_, newUpdatedEnvTail) = UpdatedEnv.split (List.length (Tuple.second env_)) newUpdatedEnv in
         let newpv = if UpdatedEnv.isUnmodified newUpdatedEnv_ then (Tuple.second pv, Nothing)
              else envToVal newUpdatedEnv_ in
         (newpv, envToA newUpdatedEnvTail)
@@ -1652,10 +1651,10 @@ consWithInversion pv menv =
 
 conssWithInversion : (List Pat, List Val) -> Maybe (Env, UpdatedEnv -> a) -> Maybe (Env, UpdatedEnv -> ((List Val, TupleDiffs VDiffs), a))
 conssWithInversion pvs menv =
-  case (menv, matchListWithInversion pvs) of
-    (Just (env, envToA), Just (env_, envToVals)) -> Just (env_ ++ env,
+  case (matchListWithInversion pvs, menv) of
+    (Just (env_, envToVals), Just (env, envToA)) -> Just (envFun.append env_ env,
       \newUpdatedEnv ->
-        let (newUpdatedEnv_, newUpdatedEnvTail) = UpdatedEnv.split (List.length env_) newUpdatedEnv in
+        let (newUpdatedEnv_, newUpdatedEnvTail) = UpdatedEnv.split (List.length (Tuple.second env_)) newUpdatedEnv in
         let newvals = if UpdatedEnv.isUnmodified newUpdatedEnv then (Tuple.second pvs, []) else envToVals newUpdatedEnv_ in
         (newvals, envToA newUpdatedEnvTail)
       )
@@ -1665,27 +1664,27 @@ conssWithInversion pvs menv =
 -- The second element takes a new environment and modifications to it, and returns the new pattern and values
 matchWithInversion : (Pat, Val) -> Maybe (Env, UpdatedEnv -> (Val, Maybe VDiffs))
 matchWithInversion (p,v) = case (p.val.p__, v.v_) of
-  (PWildcard _, _) -> Just ([], \newUpdatedEnv ->
-     case newUpdatedEnv.val of
+  (PWildcard _, _) -> Just (envFun.empty, \newUpdatedEnv ->
+     case newUpdatedEnv.val |> Tuple.second of
        [] -> (v, Nothing)
        _ -> Debug.crash <| "Not the same shape before/after pattern update: " ++ envToString newUpdatedEnv.val ++ " should have length 0"
      )
-  (PVar ws x wd, _) -> Just ([(x,v)], \newUpdatedEnv ->
-     case (newUpdatedEnv.val, newUpdatedEnv.changes) of
-       ([(x, newV)], [(0, diffs)]) -> (newV, Just diffs)
-       (_, []) -> (v, Nothing)
+  (PVar ws x wd, _) -> Just (envFun.fromLinear [(x,v)], \newUpdatedEnv ->
+     case (Dict.get x (newUpdatedEnv.val |> Tuple.first), newUpdatedEnv.changes |> Maybe.andThen (Dict.get x) ) of
+       (_, Nothing) -> (v, Nothing)
+       (Just [newV], Just [(0, diffs)]) -> (newV, Just diffs)
        _ -> Debug.crash <| "Not the same shape before/after pattern update: " ++ envToString newUpdatedEnv.val ++ " should have length 1"
      )
   (PAs sp0 spi x sp1 innerPat, _) ->
     matchWithInversion (innerPat, v) |> Maybe.map
-      (\(env, updatedEnvReverse) -> ((x,v)::env, \newUpdatedEnv ->
+      (\(env, updatedEnvReverse) -> (envFun.cons x v env, \newUpdatedEnv ->
         if UpdatedEnv.isUnmodified newUpdatedEnv then (v, Nothing) else
         let (newUpdatedEnvX, newUpdatedEnvInner) = UpdatedEnv.split 1 newUpdatedEnv in
         if UpdatedEnv.isUnmodified newUpdatedEnvX then -- Then the other environment was modified
          updatedEnvReverse newUpdatedEnvInner
         else -- newV is modified
-          case (newUpdatedEnvX.val, newUpdatedEnvX.changes) of
-          ([(_, newV)], [(0, mbModifVal)]) ->
+          case (envFun.getValue x newUpdatedEnvX.val, newUpdatedEnvX.changes |> Maybe.andThen (Dict.get x)) of
+          (Just newV, Just [(0, mbModifVal)]) ->
               if UpdatedEnv.isUnmodified newUpdatedEnvInner then
                 (newV, Just mbModifVal)
               else
@@ -1742,9 +1741,9 @@ matchWithInversion (p,v) = case (p.val.p__, v.v_) of
       )
         -- dummy VTrace, since VList itself doesn't matter
   (PList _ _ _ _ _, _) -> Nothing
-  (PConst _ n, VConst _ (n_,_)) -> if n == n_ then Just ([], \newEnv -> (v, Nothing)) else Nothing
+  (PConst _ n, VConst _ (n_,_)) -> if n == n_ then Just (envFun.empty, \newEnv -> (v, Nothing)) else Nothing
   (PConst _ n, _) -> Nothing
-  (PBase _ bv, VBase bv_) -> if eBaseToVBase bv == bv_ then Just ([], \newEnv -> (v, Nothing)) else Nothing
+  (PBase _ bv, VBase bv_) -> if eBaseToVBase bv == bv_ then Just (envFun.empty, \newEnv -> (v, Nothing)) else Nothing
   (PBase _ n, _) -> Nothing
   (PParens sp0 innerPat sp1, _) ->
     matchWithInversion (innerPat, v)
@@ -1789,10 +1788,10 @@ matchListWithInversion (ps, vs) =
   let l = List.length ps in
   let inverse_index i = l - 1 - i in
   List.foldl (\pv acc -> --: Maybe (Env, List (Env -> (Pat, Val, Env)))
-    case (acc, matchWithInversion pv) of
-      (Just (old, oldEnvBuilders), Just (new, newEnvBuilder)) -> Just (new ++ old,
+    case (matchWithInversion pv, acc) of
+      (Just (new, newEnvBuilder), Just (old, oldEnvBuilders)) -> Just (envFun.append new old,
            (\newUpdatedEnv ->
-            let (headNewUpdatedEnv, tailModifiedNewEnv) = UpdatedEnv.split (List.length new) newUpdatedEnv in
+            let (headNewUpdatedEnv, tailModifiedNewEnv) = UpdatedEnv.split (envFun.length new) newUpdatedEnv in
             if UpdatedEnv.isUnmodified headNewUpdatedEnv then
               (Tuple.second pv, Nothing, tailModifiedNewEnv)
             else
@@ -1801,7 +1800,7 @@ matchListWithInversion (ps, vs) =
           )::oldEnvBuilders
         )
       _                    -> Nothing
-  ) (Just ([], [])) (Utils.zip ps vs)
+  ) (Just (envFun.empty, [])) (Utils.zip ps vs)
   |> Maybe.map (\(finalEnv, envBuilders) -> -- envBuilders: List (Env -> (Pat, Val, Env)), but we want Env -> (Pat, Val), combining pattern/values into lists
     (finalEnv, \newUpdatedEnv ->
       if UpdatedEnv.isUnmodified newUpdatedEnv then (vs, []) else
@@ -1841,7 +1840,7 @@ removeCommonPrefix l1 l2 =
       else (l1, l2)
 
 val : Val_ -> Val
-val v_ = Val v_ (Provenance [] (eVar "DUMMYEXP") []) (Parents [])
+val v_ = Val v_ (Provenance envFun.empty (eVar "DUMMYEXP") []) (Parents [])
 
 -- vTrue    = vBool True
 -- vFalse   = vBool False
@@ -1861,7 +1860,7 @@ buildUpdatedValueFromEditorString syntax valueEditorString =
   valueEditorString
     |> Syntax.parser syntax
     |> Result.mapError (\e -> ParserUtils.showError e)
-    |> Result.andThen (Eval.doEval syntax [])
+    |> Result.andThen (Eval.doEval syntax envFun.empty)
     |> Result.map (\((v, _), _) -> v)
 
 buildUpdatedValueFromHtmlString: String -> Result String Val

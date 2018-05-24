@@ -13,6 +13,7 @@ import Pos exposing (..)
 import Utils
 import Results exposing (Results)
 import String
+import ImpureGoodies
 
 --------------------------------------------------------------------------------
 -- Whitespace
@@ -389,8 +390,136 @@ valExp val = val.provenance |> provenanceExp
 valEId : Val -> EId
 valEId val = (valExp val).val.eid
 
-type alias Env = List (Ident, Val)
+type alias Env = (Dict Ident (List Val), List Ident)
+type alias LinearEnv = List (Ident, Val)
 type alias Backtrace = List Exp
+
+-- Too bad we can't define Env ...
+envFun = let
+    cons: Ident -> Val -> Env -> Env
+    cons key value (d, idents) = (Dict.update key (\mbv ->
+      Just <| value :: Maybe.withDefault [] mbv) d, key :: idents)
+
+    conss: LinearEnv -> Env -> Env
+    conss lenv env = case lenv of
+      [] -> env
+      (key, value)::tail -> cons key value <| conss tail env
+
+    getValue: Ident -> Env -> Maybe Val
+    getValue key (d, _) = Dict.get key d |> Maybe.andThen List.head
+
+    removeOneParametrized: (List val -> Maybe (v, Maybe (List val))) -> string -> Dict string (List val) -> (Maybe v, Dict string (List val))
+    removeOneParametrized f k d = case Dict.get k d of
+        Nothing -> (Nothing, d)
+        Just l ->
+          case f l of
+            Nothing -> (Nothing, d)
+            Just (v, mblv) ->
+              let d2 = case mblv of
+                   Nothing -> Dict.remove k d
+                   Just tail -> Dict.insert k tail d
+              in
+              (Just v, d2)
+
+    removeOne: string -> Dict string (List val) -> (Maybe val, Dict string (List val))
+    removeOne = removeOneParametrized <| \lv -> case lv of
+      [] -> Nothing
+      [v] -> Just (v, Nothing)
+      v::tail -> Just (v, Just tail)
+
+    extractIdentifiers: List Ident -> Dict String (List Val) -> (LinearEnv, Dict String (List Val))
+    extractIdentifiers idents d =
+      Tuple.mapFirst List.reverse <|
+      Utils.foldLeft ([],     d) idents <|
+        \(revAcc, d) k -> removeOne k d |> Tuple.mapFirst (\mbv -> case mbv of
+          Nothing -> revAcc
+          Just v -> (k, v)::revAcc)
+
+    extractLinear: Int -> Env -> (LinearEnv, Env)
+    extractLinear n (d, idents) =
+      let (taken, nottaken) = Utils.split n idents in
+      Tuple.mapSecond (\d -> (d, nottaken)) <| extractIdentifiers taken d
+
+    toLInear: Env -> LinearEnv
+    toLInear (d, idents) =
+      Tuple.first <| extractIdentifiers idents d
+
+    fromLinear: LinearEnv -> Env
+    fromLinear lenv = (lenv |> Utils.groupBy Tuple.first |> Dict.map (\key value -> List.map Tuple.second value), List.map Tuple.first lenv)
+
+    append: Env -> Env -> Env
+    append env1 env2 = conss (toLInear env1) env2
+
+    uncons: Env -> Maybe ((String, Val), Env)
+    uncons (d, identifiers) = case identifiers of
+      [] -> Nothing
+      key::idents2 ->
+        let (mbv, d2) = removeOne key d in
+        case mbv of
+          Nothing -> Nothing
+          Just v -> Just ((key, v), (d2, idents2))
+
+    unconss: Int -> Env -> (LinearEnv, Env)
+    unconss n (d, idents) =
+      let (identsRemoved, identsKept) = Utils.split n idents in
+      extractIdentifiers identsRemoved d |> Tuple.mapSecond (\d2 -> (d2, identsKept))
+
+    length: Env -> Int
+    length (_, idents) = List.length idents
+
+    filter: (Ident -> Bool) -> Env -> Env
+    filter pred (d, identifiers) = (Dict.filter (flip (\vs -> pred)) d, List.filter pred identifiers)
+
+    removeShadowed: Env -> Env
+    removeShadowed (d, identifiers) = (d |> Dict.map (\k vs -> case vs of
+      head::tail -> [head]
+      [] -> []), identifiers)
+
+
+    -- Wraps a change to a change in the outer expression at the given index
+    offset: Int -> List (Int, a) -> List (Int, a)
+    offset n diffs = List.map (\(i, e) -> (i + n, e)) diffs
+
+    unconsTupleDiffs: TupleDiffs a -> Maybe (Maybe a, Maybe (TupleDiffs a))
+    unconsTupleDiffs tdiffs = case tdiffs of
+      [] -> Just (Nothing, Nothing)
+      [(0, a)] -> Just (Just a, Nothing)
+      (0, a)::tail -> Just (Just a, Just (offset (0 - 1) tail))
+      l -> Just (Nothing, Just (offset (0 - 1) l))
+
+    diffToLinear: Env -> EnvDiffs -> TupleDiffs VDiffs
+    diffToLinear (_, ids) diffs =
+      let aux: Int -> List Ident -> EnvDiffs -> List (Int, VDiffs) -> List (Int, VDiffs)
+          aux i ids diffs revAcc = case ids of
+        [] -> List.reverse revAcc
+        head :: tail ->
+           let (mbDiffs1, newDiffs) = envFun.removeOneParametrized envFun.unconsTupleDiffs head diffs in
+           let newRevAcc = case mbDiffs1 |> Maybe.andThen identity of
+             Nothing -> revAcc
+             Just d -> (i, d)::revAcc
+           in
+           aux (i+1) tail newDiffs newRevAcc
+      in aux 0 ids diffs []
+
+  in {
+    empty = (Dict.empty, []),
+    cons = cons,
+    conss = conss,
+    uncons = uncons,
+    unconss = unconss,
+    toLinear = toLInear,
+    fromLinear = fromLinear,
+    extractLinear = extractLinear,
+    getValue  = getValue,
+    append = append,
+    removeOneParametrized = removeOneParametrized,
+    length = length,
+    filter = filter,
+    removeShadowed = removeShadowed,
+    unconsTupleDiffs = unconsTupleDiffs,
+    diffToLinear = diffToLinear
+  }
+
 
 ------------------------------------------------------------------------------
 
@@ -1771,7 +1900,7 @@ strPos p =
 -- val = flip Val (Provenance [] dummyExp)
 
 builtinVal: String -> Val_ -> Val
-builtinVal msg x = Val x (Provenance [] (withDummyExpInfo (EVar space0 "msg" )) []) (Parents [])
+builtinVal msg x = Val x (Provenance envFun.empty (withDummyExpInfo (EVar space0 "msg" )) []) (Parents [])
 
 exp_ : Exp__ -> Exp_
 exp_ = flip Exp_ (-1)
@@ -1849,7 +1978,7 @@ dummyTrace_ b = TrLoc (dummyLoc_ b)
 
 dummyLoc     = dummyLoc_ unann
 dummyTrace   = dummyTrace_ unann
-dummyProvenance = Provenance [] (eTuple0 []) []
+dummyProvenance = Provenance envFun.empty (eTuple0 []) []
 
 -- TODO interacts badly with auto-abstracted variable names...
 dummyLocWithDebugInfo : Frozen -> Num -> Loc
@@ -3487,9 +3616,9 @@ type VDictElemDiff = VDictElemDelete | VDictElemInsert | VDictElemUpdate VDiffs
 
 type StringDiffs = StringUpdate {-original start: -}Int {-original end: -}Int {- chars replacing -}Int
 
-type alias EnvDiffs = TupleDiffs VDiffs
+type alias EnvDiffs = Dict String (TupleDiffs VDiffs)
 -- The environment of a closure if it was modified, the modifications of an environment else.
-type VDiffs = VClosureDiffs EnvDiffs (Maybe EDiffs)
+type VDiffs = VClosureDiffs (Maybe EnvDiffs) (Maybe EDiffs)
             | VListDiffs (ListDiffs VDiffs)
             | VStringDiffs (List StringDiffs)
             | VDictDiffs (Dict (String, String) VDictElemDiff)

@@ -19,7 +19,7 @@ import Pos exposing (Pos)
 type alias UpdatedExp = { val: Exp, changes: Maybe EDiffs }
 type alias UpdatedExpTuple = { val: List Exp, changes: Maybe (TupleDiffs EDiffs) }
 
-type alias PrevLets = Env -- In traversing order
+type alias PrevLets = LinearEnv -- In traversing order
 
 type HandlePreviousResult = HandlePreviousResult String (UpdatedEnv -> UpdatedExp -> UpdateStack)
 type Fork = Fork String UpdateStack (LazyList HandlePreviousResult) (LazyList Fork)
@@ -311,27 +311,20 @@ postMapExp f e =
   let newElem = rebuilder newChildren in
   (f newElem) |> Maybe.withDefault newElem
 
+-- Given two environments, one before and one after execution,
+-- returns in order the list of assigned names and values
+keepLets: Env -> Env -> PrevLets
+keepLets ((_, origEnvIds) as origEnv) ((_, newEnvIds) as newEnv) =
+   envFun.extractLinear (List.length newEnvIds - List.length origEnvIds) newEnv |> Tuple.first |> List.reverse
 
-keepLets origEnv newEnv = List.reverse <| List.take (List.length newEnv - List.length origEnv) newEnv
-
-prevLetsFind: (Val_ -> Val) -> PrevLets -> Pat-> Maybe (Val, Env)
+-- Takes the cache (PrevLets) and finds the value that would be associated to Pat if the cache is in order.
+prevLetsFind: (Val_ -> Val) -> PrevLets -> Pat-> Maybe (Val, PrevLets)
 prevLetsFind val_ env p =
-  let smallestEnv: Env -> Env -> Env
-      smallestEnv env1 env2 =
-        if List.length  env1 < List.length env2 then env1 else env2
-  in
-  let smallestEnvSuffix: List (Val, Env) -> (List Val, Env)
-      smallestEnvSuffix vs = case vs of
-        [] -> ([], env)
-        (headVal, headEnv)::tail ->
-          let (newTail, newTailEnv) = smallestEnvSuffix tail in
-          (headVal::newTail, smallestEnv headEnv newTailEnv)
-  in
   let deconstructEnv name env = case env of
     [] -> Nothing
     ((headname, headval)::tail) -> if headname == name then Just (headval, tail) else Nothing
   in
-  let recurse: PrevLets -> Pat -> Maybe (Val, Env)
+  let recurse: PrevLets -> Pat -> Maybe (Val, PrevLets)
       recurse env p =
     case p.val.p__ of
        PVar _ name _ -> deconstructEnv name env

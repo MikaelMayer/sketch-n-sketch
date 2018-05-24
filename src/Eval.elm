@@ -14,6 +14,7 @@ import Types
 import Utils
 import Record
 import Info
+import Pos
 import ParserUtils
 import LangUtils exposing (..)
 import HTMLValParser
@@ -36,7 +37,7 @@ valToDictKey syntax bt v =
 ------------------------------------------------------------------------------
 -- Big-Step Operational Semantics
 
-match : (Pat, Val) -> Maybe Env
+match : (Pat, Val) -> Maybe LinearEnv
 match (p,v) = case (p.val.p__, v.v_) of
   (PWildcard _, _) -> Just []
   (PVar _ x _, _) -> Just [(x,v)]
@@ -57,7 +58,7 @@ match (p,v) = case (p.val.p__, v.v_) of
         , parents = Parents []
         }
       in
-      cons (rest, vRest) (matchList (Utils.zip ps vs1))
+      consLinear (rest, vRest) (matchList (Utils.zip ps vs1))
         -- dummy Provenance, since VList itself doesn't matter
   (PList _ _ _ _ _, _) -> Nothing
   (PConst _ n, VConst _ (n_,_)) -> if n == n_ then Just [] else Nothing
@@ -79,7 +80,7 @@ match (p,v) = case (p.val.p__, v.v_) of
   --_ -> Debug.crash <| "Little evaluator bug: Eval.match " ++ (toString p.val.p__) ++ " vs " ++ (toString v.v_)
 
 
-matchList : List (Pat, Val) -> Maybe Env
+matchList : List (Pat, Val) -> Maybe LinearEnv
 matchList pvs =
   List.foldl (\pv acc ->
     case (acc, match pv) of
@@ -88,25 +89,32 @@ matchList pvs =
   ) (Just []) pvs
 
 
-cons : (Pat, Val) -> Maybe Env -> Maybe Env
-cons pv menv =
-  case (menv, match pv) of
-    (Just env, Just env_) -> Just (env_ ++ env)
+consLinear : (Pat, Val) -> Maybe LinearEnv -> Maybe LinearEnv
+consLinear pv menv =
+  case (match pv, menv) of
+    (Just lenv_, Just env) -> Just (lenv_ ++ env)
     _                     -> Nothing
 
+cons : (Pat, Val) -> Maybe Env -> Maybe Env
+cons pv menv =
+  case (match pv, menv) of
+    (Just lenv_, Just env) -> Just (envFun.conss lenv_ env)
+    _                     -> Nothing
 
+lookupVar: Syntax.Syntax -> Env -> Backtrace -> Ident -> Pos.Pos -> Result String Val
 lookupVar syntax env bt x pos =
-  case Utils.maybeFind x env of
+  let (valueFound, time) = ImpureGoodies.timedRun (\_ -> envFun.getValue x env) in
+  let _ = if time > 100 then Debug.log ("Unexpected slowdown for looking for " ++ x ++ " in environment:" ++ toString time) () else () in
+  case valueFound of
     Just v  -> Ok v
-    Nothing -> errorWithBacktrace syntax bt <| strPos pos ++ " variable not found: " ++ x ++ "\nVariables in scope: " ++ (String.join " " <| List.map Tuple.first env)
-
+    Nothing -> errorWithBacktrace syntax bt <| strPos pos ++ " variable not found: " ++ x ++ "\nVariables in scope: " ++ (String.join " " <| Tuple.second env)
 
 mkCap mcap l =
   let s =
     case (mcap, l) of
-      (Just cap, _)       -> cap.val
-      (Nothing, (_,_,"")) -> strLoc l
-      (Nothing, (_,_,x))  -> x
+       (Just cap, _)       -> cap.val
+       (Nothing, (_,_,"")) -> strLoc l
+       (Nothing, (_,_,x))  -> x
   in
   s ++ ": "
 
@@ -299,20 +307,20 @@ eval syntax env bt e =
 
   EApp sp0 e1 es appStyle sp1 ->
     if appStyle == InfixApp && eVarUnapply e1 == Just "++" then
-        case es of
-          [eLeft, eRight] -> -- We rewrite ++ to a call to "append" or "plus" depending on the arguments
-            case (eval_ syntax env bt_ eLeft, eval_ syntax env bt_ eRight) of
-              (Ok (v1, ws1), Ok (v2, ws2)) ->
-                 case (v1.v_, v2.v_) of
-                   (VBase (VString x), VBase (VString y)) ->
-                     eval syntax ([("x", v1), ("y", v2)] ++ env) bt_  (ImpureGoodies.logTimedRun "replacing expression" <| \_ -> replaceE__ e <|
-                       EOp space1 space1 (withDummyRange Plus) [replaceE__ eLeft <| EVar space0 "x", replaceE__ eRight <| EVar space0 "y"] space0)
-                   _ ->
-                     eval syntax ([("x", v1), ("y", v2)] ++ env) bt_ (ImpureGoodies.logTimedRun "replacing expression" <| \_ -> replaceE__ e <|
-                       EApp sp0 (replaceE__ e1 <| EVar sp0 "append") [replaceE__ eLeft <| EVar space1 "x", replaceE__ eRight <| EVar space1 "y"] SpaceApp sp1)
-              (Err s, _) -> Err s
-              (_, Err s) -> Err s
-          _ -> Err ("++ should be called with two arguments, was called on "++toString (List.length es)++". ")
+      case es of
+        [eLeft, eRight] -> -- We rewrite ++ to a call to "append" or "plus" depending on the arguments
+          case (eval_ syntax env bt_ eLeft, eval_ syntax env bt_ eRight) of
+            (Ok (v1, ws1), Ok (v2, ws2)) ->
+               case (v1.v_, v2.v_) of
+                 (VBase (VString x), VBase (VString y)) ->
+                   eval syntax (envFun.conss [("x", v1), ("y", v2)] env) bt_  (ImpureGoodies.logTimedRun "replacing expression" <| \_ -> replaceE__ e <|
+                     EOp space1 space1 (withDummyRange Plus) [replaceE__ eLeft <| EVar space0 "x", replaceE__ eRight <| EVar space0 "y"] space0)
+                 _ ->
+                   eval syntax (envFun.conss [("x", v1), ("y", v2)] env) bt_ (ImpureGoodies.logTimedRun "replacing expression" <| \_ -> replaceE__ e <|
+                     EApp sp0 (replaceE__ e1 <| EVar sp0 "append") [replaceE__ eLeft <| EVar space1 "x", replaceE__ eRight <| EVar space1 "y"] SpaceApp sp1)
+            (Err s, _) -> Err s
+            (_, Err s) -> Err s
+        _ -> Err ("++ should be called with two arguments, was called on "++toString (List.length es)++". ")
     else
     case (if (eVarUnapply e1 == Just "++") then (ImpureGoodies.logTimedRun "evaluating ++") else \x -> x ()) <| \_ -> eval_ syntax env bt_ e1 of
       Err s -> Err s
@@ -324,7 +332,7 @@ eval syntax env bt e =
               let argValsAndFuncRes =
                 case maybeRecName of
                   Nothing    -> apply syntax env bt bt_ e ps es funcBody closureEnv
-                  Just fName -> apply syntax env bt bt_ e ps es funcBody ((fName, v1)::closureEnv)
+                  Just fName -> apply syntax env bt bt_ e ps es funcBody (envFun.cons fName v1 closureEnv)
               in
               -- Do not record dependence on closure (which function to execute is essentially control flow).
               -- Dependence on function is implicit by being dependent on some value computed by an expression in the function.
@@ -347,7 +355,7 @@ eval syntax env bt e =
                      Nothing
                      (List.map (\a -> withDummyPatInfo <| PVar space1 a noWidgetDecl) <| argList)
                      (replaceE__ e <| EApp sp0 (replaceE__ e <| EVar space1 name)
-                       (List.map (withDummyExpInfo << EVar space1) <| argList) SpaceApp sp0) ((name, v1)::env) in
+                       (List.map (withDummyExpInfo << EVar space1) <| argList) SpaceApp sp0) (envFun.cons name v1 env) in
                 evalVApp funconverted es
               else
                 let (arguments, remaining) = Utils.split arity es in
@@ -681,8 +689,8 @@ apply syntax env bt bt_ e psLeft esLeft funcBody closureEnv =
             case fRetVal1.v_ of
               VClosure maybeRecName ps funcBody closureEnv ->
                 case maybeRecName of
-                  Nothing    -> recurse ps esLeft funcBody closureEnv                      |> Result.map (\(argVals, (v2, ws2)) -> (argVals, (v2, fRetWs1 ++ ws2)))
-                  Just fName -> recurse ps esLeft funcBody ((fName, fRetVal1)::closureEnv) |> Result.map (\(argVals, (v2, ws2)) -> (argVals, (v2, fRetWs1 ++ ws2)))
+                  Nothing    -> recurse ps esLeft funcBody closureEnv                              |> Result.map (\(argVals, (v2, ws2)) -> (argVals, (v2, fRetWs1 ++ ws2)))
+                  Just fName -> recurse ps esLeft funcBody (envFun.cons fName fRetVal1 closureEnv) |> Result.map (\(argVals, (v2, ws2)) -> (argVals, (v2, fRetWs1 ++ ws2)))
               _ ->
                 errorWithBacktrace syntax (e::bt) <| strPos e.start ++ " too many arguments given to function"
           )

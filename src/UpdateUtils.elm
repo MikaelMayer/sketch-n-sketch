@@ -635,9 +635,9 @@ valToListElemDiff subroutine v = case Vu.constructor Ok v of
 
 -- Instantiation of differences
 envDiffsToVal: Vb.Vb -> EnvDiffs -> Val
-envDiffsToVal = tupleDiffsToVal vDiffsToVal
+envDiffsToVal = Vb.record (tupleDiffsToVal vDiffsToVal)
 valToEnvDiffs: Val -> Result String EnvDiffs
-valToEnvDiffs = valToTupleDiffs valToVDiffs
+valToEnvDiffs = Vu.record (valToTupleDiffs valToVDiffs)
 
 vDictElemDiffToVal: Vb.Vb -> VDictElemDiff -> Val
 vDictElemDiffToVal vb velem = case velem of
@@ -656,7 +656,7 @@ valToVDictElemDiff v = case Vu.constructor Ok v of
 -- Val encoding of VDiffs
 vDiffsToVal: Vb.Vb -> VDiffs -> Val
 vDiffsToVal vb vdiffs = case vdiffs of
-  VClosureDiffs e mbe -> (Vb.constructor vb) "VClosureDiffs" [envDiffsToVal vb e, Vb.maybe eDiffsToVal vb mbe]
+  VClosureDiffs e mbe -> (Vb.constructor vb) "VClosureDiffs" [Vb.maybe envDiffsToVal vb e, Vb.maybe eDiffsToVal vb mbe]
   VListDiffs list     -> (Vb.constructor vb) "VListDiffs"    [listDiffsToVal vDiffsToVal vb list]
   VStringDiffs list   -> (Vb.constructor vb) "VStringDiffs"  [Vb.list stringDiffsToVal vb list]
   VConstDiffs         -> (Vb.constructor vb) "VConstDiffs"   []
@@ -666,7 +666,7 @@ vDiffsToVal vb vdiffs = case vdiffs of
 
 valToVDiffs: Val -> Result String VDiffs
 valToVDiffs v = case Vu.constructor Ok v of
-  Ok ("VClosureDiffs", [v1, v2]) -> Result.map2 VClosureDiffs (valToEnvDiffs v1) (Vu.maybe valToEDiffs v2)
+  Ok ("VClosureDiffs", [v1, v2]) -> Result.map2 VClosureDiffs (Vu.maybe valToEnvDiffs v1) (Vu.maybe valToEDiffs v2)
   Ok ("VListDiffs"   , [l]) -> valToListDiffs valToVDiffs l |> Result.map VListDiffs
   Ok ("VStringDiffs",  [l]) -> Vu.list valToStringDiffs l |> Result.map VStringDiffs
   Ok ("VConstDiffs"  , []) -> Ok VConstDiffs
@@ -727,11 +727,17 @@ tupleDiffsToString mbStructName subroutine indent originalEnv modifiedEnv envDif
    "\n" ++ indent ++ structName ++ " = ...") mbStructName |> Maybe.withDefault "") ++
    aux  0 originalEnv modifiedEnv envDiffs ""
 
-envDiffsToString_ = tupleDiffsToString (Just "environment") <| \indent (kOriginal, valueOriginal) (kModified, valueModified) change ->
-  (if kOriginal /= kModified then
-   "\n" ++ indent ++ "Weird: a name changed from " ++ kOriginal ++ " to " ++ kModified
-   else "") ++ "\n" ++ indent ++ "Variable " ++ kOriginal ++" changes to value:" ++
-   vDiffsToString_ (indent ++ "  ") valueOriginal valueModified change
+
+envDiffsToString_: String -> Env -> Env -> EnvDiffs -> String
+envDiffsToString_ indent (originalEnv, _) (modifiedEnv, _) envDiffs =
+  Dict.toList envDiffs |> List.map (\(key, valuesDiffs) ->
+    (\x -> case x of
+      Err msg -> msg
+      Ok s -> s ) <|
+    flip Result.andThen (Dict.get key originalEnv |> Result.fromMaybe "<key not found in original env>") <| \originalValues ->
+    flip Result.andThen (Dict.get key modifiedEnv |> Result.fromMaybe "<key not found in modified env>") <| \modifiedValues ->
+    Ok <| tupleDiffsToString (Just "environment") vDiffsToString_ indent originalValues modifiedValues valuesDiffs
+  ) |> String.join ""
 
 envDiffsToString = envDiffsToString_ ""
 
@@ -849,9 +855,9 @@ vRecordDiffsToString indent originals modified diffs =
         _ -> "[Internal error] Inconsistency between diff and values " ++ toString diff ++ "," ++ (Maybe.map valToString maybeOriginal |> Maybe.withDefault "") ++ "," ++ (Maybe.map valToString maybeModified |> Maybe.withDefault "")
     ) originals modified diffs
 
-vClosureDiffsToString: String -> Env -> Exp -> Env -> Exp -> EnvDiffs -> Maybe EDiffs -> String
-vClosureDiffsToString indent origEnv origBody modifEnv modifBody diffEnv maybeDiffBody =
-  envDiffsToString_ indent origEnv modifEnv diffEnv ++
+vClosureDiffsToString: String -> Env -> Exp -> Env -> Exp -> Maybe EnvDiffs -> Maybe EDiffs -> String
+vClosureDiffsToString indent origEnv origBody modifEnv modifBody maybeDiffEnv maybeDiffBody =
+  (Maybe.map (\diffEnv -> envDiffsToString_ indent origEnv modifEnv diffEnv) maybeDiffEnv |> Maybe.withDefault "") ++
     (Maybe.map (\ediff ->
       eDiffsToString indent origBody modifBody ediff
     ) maybeDiffBody |> Maybe.withDefault "")
@@ -1394,11 +1400,11 @@ defaultVDiffsRec testEquality recurse original modified =
             Nothing ->
               case mbEDiff of
                 Nothing -> Nothing
-                _ -> Just <| VClosureDiffs [] mbEDiff
-            Just x -> Just <| VClosureDiffs x mbEDiff
+                _ ->  Just <| VClosureDiffs mbEnvDiff mbEDiff
+            Just x -> Just <| VClosureDiffs mbEnvDiff mbEDiff
       ))
     (VDict original, VDict modified) ->
-      defaultDictDiffs valToString recurse original modified
+      defaultVDictDiffs valToString recurse original modified
     (VRecord original, VRecord modified) ->
       case (Dict.get Lang.ctorDataType original, Dict.get ctorDataType modified) of
         (Just x, Just  y) -> case (x.v_, y.v_) of
@@ -1520,61 +1526,41 @@ defaultEnvDiffs: Set Ident -> Env -> Env -> Results String (Maybe EnvDiffs)
 defaultEnvDiffs = defaultEnvDiffsRec True defaultVDiffs
 
 defaultEnvDiffsRec: Bool     -> (Val -> Val -> Results String (Maybe VDiffs)) -> Set Ident -> Env -> Env -> Results String (Maybe EnvDiffs)
-defaultEnvDiffsRec testEquality recurse identsToCompare elems1 elems2 =
-  let aux: Int -> Set Ident    -> List (Int, VDiffs) -> Env         -> Env -> Results String (Maybe EnvDiffs)
-      aux  i      identsToCompare revEnvDiffs           envToCollect1  envToCollect2 =
-        if Set.isEmpty identsToCompare then
-          case List.reverse revEnvDiffs of
-            [] -> ok1 Nothing
-            envDiffs -> ok1 <| Just envDiffs
-        else
-        case (envToCollect1, envToCollect2) of
-          ([], []) ->
-            case List.reverse revEnvDiffs of
-              [] -> ok1 Nothing
-              envDiffs -> ok1 <| Just envDiffs
-          (((k1, v1) as ehd1)::etl1, ((k2, v2) as ehd2)::etl2) ->
-            if k1 /= k2 then Errs <| "trying to compute a diff on unaligned environments " ++ k1 ++ "," ++ k2 else
-            if not (Set.member k1 identsToCompare) then
-              aux (i + 1) identsToCompare revEnvDiffs etl1 etl2
-            else if testEquality && valEqualDiff v1 v2 then
-              aux (i + 1) (Set.remove k1 identsToCompare) revEnvDiffs etl1 etl2
-            else
-              recurse v1 v2 |> Results.andThen ((\i k1 identsToCompare etl1 etl2 revEnvDiffs mbv ->
-                let newRevEnvDiffs = case mbv of
-                  Nothing -> revEnvDiffs
-                  Just v -> (i, v)::revEnvDiffs
-                in
-                aux (i + 1) (Set.remove k1 identsToCompare) newRevEnvDiffs etl1 etl2
-              ) i k1 identsToCompare etl1 etl2 revEnvDiffs)
-          _ -> Errs <| "Environments do not have the same size: " ++ envToString envToCollect1 ++ ", " ++ envToString envToCollect2
-  in aux 0 identsToCompare  [] elems1 elems2
+defaultEnvDiffsRec testEquality recurse identsToCompare (elems1, idents1) (elems2, idents2) =
+  if idents1 /= idents2 then Errs <|
+    "Expected environments to have the same keys, but got " ++ (List.map2 (\i j -> i ++ "," ++ j) idents1 idents2 |> String.join "\n") ++ " of sizes " ++
+      toString (List.length idents1) ++ " and " ++ toString (List.length idents2)
+  else
+  let keepIfIdent = Dict.filter (\key value -> Set.member key identsToCompare) in
+  defaultDictDiffs (\vs -> List.map valToString vs |> String.join ",") (\v1s v2s ->
+    defaultTupleDiffs valToString recurse v1s v2s
+  ) (keepIfIdent elems1) (keepIfIdent elems2)
 
 defaultTupleDiffs: (a -> String) -> (a -> a -> Results String (Maybe b)) -> List a -> List a -> Results String (Maybe (TupleDiffs b)) -- lowercase val so that it can be applied to something else?
 defaultTupleDiffs keyOf defaultElemModif elems1 elems2 =
   let aux: Int -> List (Int, b) -> List a  -> List a -> Results String (Maybe (TupleDiffs b))
-      aux  i      revEnvDiffs          l1         l2 =
+      aux  i      revTupleDiffs    l1         l2 =
         case (l1, l2) of
           ([], []) ->
-            case List.reverse revEnvDiffs of
+            case List.reverse revTupleDiffs of
               [] -> ok1 Nothing
               tupleDiffs -> ok1 <| Just tupleDiffs
 
           (v1::etl1, v2::etl2) ->
             if keyOf v1 == keyOf v2 then
-              aux (i + 1) revEnvDiffs etl1 etl2
+              aux (i + 1) revTupleDiffs etl1 etl2
             else
-              defaultElemModif v1 v2 |> Results.andThen ((\i etl1 etl2 revEnvDiffs mbv ->
+              defaultElemModif v1 v2 |> Results.andThen ((\i etl1 etl2 revTupleDiffs mbv ->
                  let newRevEnvDiffs = case mbv of
-                   Nothing -> revEnvDiffs
-                   Just v -> (i, v)::revEnvDiffs
+                   Nothing -> revTupleDiffs
+                   Just v -> (i, v)::revTupleDiffs
                  in
-                 aux (i + 1) newRevEnvDiffs etl1 etl2) i etl1 etl2 revEnvDiffs)
+                 aux (i + 1) newRevEnvDiffs etl1 etl2) i etl1 etl2 revTupleDiffs)
           _ -> Errs <| "Tuples do not have the same size: " ++ toString l1 ++ ", " ++ toString l2
   in aux 0 [] elems1 elems2
 
-defaultDictDiffs: (Val -> String) -> (Val -> Val -> Results String (Maybe VDiffs)) -> Dict (String, String) Val -> Dict (String, String) Val -> Results String (Maybe VDiffs)
-defaultDictDiffs keyOf defaultElemModif elems1 elems2 =
+defaultVDictDiffs: (Val -> String) -> (Val -> Val -> Results String (Maybe VDiffs)) -> Dict (String, String) Val -> Dict (String, String) Val -> Results String (Maybe VDiffs)
+defaultVDictDiffs keyOf defaultElemModif elems1 elems2 =
   Results.map (\d -> if Dict.isEmpty d then Nothing else Just <| VDictDiffs d) <| Dict.merge
     (\k1 v1 acc -> Results.map (Dict.insert k1 VDictElemDelete) acc)
     (\k v1 v2 acc -> if keyOf v1 == keyOf v2 then acc
@@ -1589,13 +1575,19 @@ defaultDictDiffs keyOf defaultElemModif elems1 elems2 =
 
 defaultRecordDiffs: (Val -> String) -> (Val -> Val -> Results String (Maybe VDiffs)) -> Dict String Val -> Dict String Val -> Results String (Maybe VDiffs)
 defaultRecordDiffs keyOf defaultElemModif elems1 elems2 =
-  Results.map (\d -> if Dict.isEmpty d then Nothing else Just <| VRecordDiffs d) <| Dict.merge
+  defaultDictDiffs keyOf defaultElemModif elems1 elems2 |>
+  Results.map (Maybe.map VRecordDiffs)
+
+defaultDictDiffs: (val -> String) -> (val -> val -> Results String (Maybe vdiffs)) -> Dict String val -> Dict String val -> Results String (Maybe (Dict String vdiffs))
+defaultDictDiffs keyOf defaultElemModif elems1 elems2 =
+  Results.map (\d -> if Dict.isEmpty d then Nothing else Just d) <|
+  Dict.merge
     (\k1 v1 acc -> Errs <| "Not allowed to remove a key from record:" ++ k1)
     (\k v1 v2 acc -> if keyOf v1 == keyOf v2 then acc else acc |> Results.andThen (\acc ->
       defaultElemModif v1 v2 |> Results.map (\mbv ->
         mbv |> Maybe.map (\v ->
          Dict.insert k v acc) |> Maybe.withDefault acc)))
-    (\k2 v2 acc -> Errs <| "Not allowed to insert a key to record:" ++ k2 ++ " " ++ valToString v2)
+    (\k2 v2 acc -> Errs <| "Not allowed to insert a key to record:" ++ k2 ++ " " ++ keyOf v2)
     elems1
     elems2
     (ok1 Dict.empty)
@@ -1642,45 +1634,16 @@ mergeTuple submerger =
                        toString origTuple ++ ", " ++ toString newTup2 ++ ", " ++ toString newTup3
     in aux 0 [] []
 
-mergeEnv: Env -> Env -> EnvDiffs -> Env -> EnvDiffs -> (Env, EnvDiffs)
-mergeEnv originalEnv_ newEnv2_ modifs2_ newEnv3_ modifs3_ =
-  let aux: Int -> Env -> List (Int,  VDiffs) -> Env ->     Env ->  List (Int,  VDiffs) -> Env ->  List (Int,  VDiffs) -> (Env, EnvDiffs)
-      aux  i      accEnv accDiffs              originalEnv newEnv2 modifs2                newEnv3 modifs3=
-    --let _ = Debug.log ("aux " ++ toString i ++ "\n" ++
-    --                                  (List.take 5 originalEnv |> List.map Tuple.first |> String.join ",") ++ "...\n" ++
-    --                                  (List.take 5 newEnv2 |> List.map Tuple.first |> String.join ",") ++ "...\n" ++
-    --                                  (List.take 5 newEnv3 |> List.map Tuple.first |> String.join ",") ++ "...\n" ++ "\nModifications:\n" ++
-    --                                  toString modifs2 ++ "\n" ++ toString modifs3) () in-}
-    case (originalEnv, newEnv2, modifs2, newEnv3, modifs3) of
-       ([], [], [], [], []) -> (List.reverse accEnv, List.reverse accDiffs)
-       (_, _, [], _, _) ->     (List.reverse accEnv ++ newEnv3, List.reverse accDiffs ++ modifs3)
-       (_, _, _, _, []) ->     (List.reverse accEnv ++ newEnv2, List.reverse accDiffs ++ modifs2)
-       (((x, v1) as xv1)::oe, (y, v2)::ne2, (m2, md2)::m2tail, (z, v3)::ne3, (m3, md3)::m3tail) ->
-         if x /= y || y /= z || x /= z then
-           Debug.crash <| "Expected environments to have the same variables, got\n" ++
-            x ++ " = " ++ valToString v1 ++ "\n" ++
-            y ++ " = " ++ valToString v2 ++ "\n" ++
-            z ++ " = " ++ valToString v3 ++ "\n" ++
-             (List.take 5 originalEnv |> List.map Tuple.first |> String.join ",") ++ "\n" ++
-             (List.take 5 newEnv2 |> List.map Tuple.first |> String.join ",") ++ "\n" ++
-             (List.take 5 newEnv3 |> List.map Tuple.first |> String.join ",") ++ "\n" ++ "\nOriginals:\n" ++
-             envToString originalEnv_ ++ "\n" ++ envToString newEnv2_ ++ "\n" ++ envToString newEnv3_++ "\nModifications:\n" ++
-             toString modifs2_ ++ "\n" ++ toString modifs3_
-         else if m2 == i && m3 == i then
-          let (newVal, newDiffs) = mergeVal v1 v2 md2 v3 md3 in
-          aux (i + 1) ((x, newVal)::accEnv) ((i, newDiffs)::accDiffs) oe ne2 m2tail ne3 m3tail
-         else if m2 == i then
-           aux (i + 1) ((x, v2)::accEnv) ((i, md2)::accDiffs) oe ne2 m2tail ne3 modifs3
-         else if m3 == i then
-           aux (i + 1) ((x, v3)::accEnv) ((i, md3)::accDiffs) oe ne2 modifs2 ne3 m3tail
-         else
-           let countToIgnore = min (m3 - i) (m2 - i) in
-           let (toInsert, toRemain) = Utils.split countToIgnore originalEnv in
-           aux (i + countToIgnore) (reverseInsert toInsert accEnv) accDiffs toRemain (List.drop countToIgnore newEnv2) modifs2 (List.drop countToIgnore newEnv3) modifs3
-       _ -> Debug.crash <| "Expected environments to have the same size, got\n" ++
-                     envToString originalEnv ++ ", " ++ envToString newEnv2 ++ ", " ++ envToString newEnv3 ++ "\nOriginals:\n" ++
-                     envToString originalEnv_ ++ ", " ++ envToString newEnv2_ ++ ", " ++ envToString newEnv3_
-  in aux 0 [] [] originalEnv_ newEnv2_ modifs2_ newEnv3_ modifs3_
+mergeEnv: Env -> Env -> Maybe EnvDiffs -> Env -> Maybe EnvDiffs -> (Env, Maybe EnvDiffs)
+mergeEnv (originalEnv_, originalIdents) ((newEnv2_, _) as env2) modified2 ((newEnv3_, _) as env3) modified3 =
+  case modified2 of
+      Nothing -> (env3, modified3)
+      Just modifs2_ -> case modified3 of
+        Nothing -> (env2, modified2)
+        Just modifs3_ ->
+          mergeDict (mergeTuple mergeVal) originalEnv_ newEnv2_ modifs2_ newEnv3_ modifs3_
+          |> Tuple.mapFirst (\v -> (v, originalIdents))
+          |> Tuple.mapSecond (\d -> if Dict.isEmpty d then Nothing else Just d)
 
 mergeInt: Int -> Int -> Int -> Int
 mergeInt original modified1 modified2 =
@@ -1726,7 +1689,7 @@ mergeVal  original modified1 modifs1   modified2 modifs2 =
       (replaceV_ original <| VRecord <| newDict, VRecordDiffs newDiffs)
 
     (VDict originalDict, VDict modified1Dict, VDictDiffs d1, VDict modified2Dict, VDictDiffs d2) ->
-      let (newDict, newDiffs) = mergeDict mergeVal originalDict modified1Dict d1 modified2Dict d2 in
+      let (newDict, newDiffs) = mergeVDict mergeVal originalDict modified1Dict d1 modified2Dict d2 in
       (replaceV_ original <| VDict <| newDict, VDictDiffs newDiffs)
 
     (VClosure mbRec0 pats0 body0 env0, VClosure mbRec1 pats1 body1 env1, VClosureDiffs envmodifs1 bodymodifs1, VClosure mbRec2 pats2 body2 env2, VClosureDiffs envmodifs2 bodymodifs2) ->
@@ -2023,11 +1986,11 @@ mergeList submerger =
              aux (i+untouched) (reverseInsert originalUntouched accMerged, accDiffs) originalRemaining (List.drop untouched modified1) modifs1 (List.drop untouched modified2) modifs2
   in aux 0 ([], [])
 
-mergeDict: (v -> v -> VDiffs -> v -> VDiffs -> (v, VDiffs)) -> Dict k v -> Dict k v -> Dict k VDictElemDiff -> Dict k v -> Dict k VDictElemDiff -> (Dict k v, Dict k VDictElemDiff)
-mergeDict submerger originalDict modified1Dict modifs1 modified2Dict modifs2 =
-  let get0 name = Dict.get name originalDict  |> Utils.fromJust_ "mergeDict0" in
-  let get1 name = Dict.get name modified1Dict |> Utils.fromJust_ "mergeDict1" in
-  let get2 name = Dict.get name modified2Dict |> Utils.fromJust_ "mergeDict2" in
+mergeVDict: (v -> v -> VDiffs -> v -> VDiffs -> (v, VDiffs)) -> Dict k v -> Dict k v -> Dict k VDictElemDiff -> Dict k v -> Dict k VDictElemDiff -> (Dict k v, Dict k VDictElemDiff)
+mergeVDict submerger originalDict modified1Dict modifs1 modified2Dict modifs2 =
+  let get0 name = Dict.get name originalDict  |> Utils.fromJust_ "mergeVDict0" in
+  let get1 name = Dict.get name modified1Dict |> Utils.fromJust_ "mergeVDict1" in
+  let get2 name = Dict.get name modified2Dict |> Utils.fromJust_ "mergeVDict2" in
   Dict.merge
        (\kIn1 vIn1 (accDict, accDiffs) ->
           case vIn1 of
@@ -2059,8 +2022,13 @@ mergeDict submerger originalDict modified1Dict modifs1 modified2Dict modifs2 =
        modifs2
        (originalDict, Dict.empty)
 
-mergeRecord: (v -> v -> VDiffs -> v -> VDiffs -> (v, VDiffs)) -> Dict k v -> Dict k v -> Dict k VDiffs -> Dict k v -> Dict k VDiffs -> (Dict k v, Dict k VDiffs)
+mergeRecord: (Val -> Val -> VDiffs -> Val -> VDiffs -> (Val, VDiffs)) ->
+  Dict String Val -> Dict String Val -> Dict String VDiffs -> Dict String Val -> Dict String VDiffs -> (Dict String Val, Dict String VDiffs)
 mergeRecord submerger originalDict modified1Dict modifs1 modified2Dict modifs2 =
+  mergeDict submerger originalDict modified1Dict modifs1 modified2Dict modifs2
+
+mergeDict: (v -> v -> vdiffs -> v -> vdiffs -> (v, vdiffs)) -> Dict k v -> Dict k v -> Dict k vdiffs -> Dict k v -> Dict k vdiffs -> (Dict k v, Dict k vdiffs)
+mergeDict submerger originalDict modified1Dict modifs1 modified2Dict modifs2 =
   let get0 name = Dict.get name originalDict  |> Utils.fromJust_ "mergeDict0" in
   let get1 name = Dict.get name modified1Dict |> Utils.fromJust_ "mergeDict1" in
   let get2 name = Dict.get name modified2Dict |> Utils.fromJust_ "mergeDict2" in
